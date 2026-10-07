@@ -1,0 +1,19 @@
+name: EncodeBridge Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-draft:
+    uses: morannbon/TvAIr-Actions/.github/workflows/reusable-build-release.yml@v1.0.1
+    with:
+      product_name: EncodeBridge
+      solution: EncodeBridge.sln
+      package_script: .github/scripts/package.ps1
+      platforms_json: '["x64","x86"]'

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Platforms>AnyCPU;x86;x64</Platforms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>EncodeBridge</AssemblyName>
+    <RootNamespace>EncodeBridge</RootNamespace>
+    <Version>1.0.0</Version>
+    <FileVersion>1.0.0.0</FileVersion>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <OutputType>Library</OutputType>
+    <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)'=='x86'"><PlatformTarget>x86</PlatformTarget></PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)'=='x64'"><PlatformTarget>x64</PlatformTarget></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\TvAIrPlugin\TvAIrPlugin.csproj" />
+  </ItemGroup>
+</Project>

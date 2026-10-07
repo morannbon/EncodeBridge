@@ -1,0 +1,26 @@
+EncodeBridge ライセンス
+
+Copyright (c) 2026 TvAIr Project.
+All rights reserved.
+
+本ライセンスはEncodeBridge本体のソースコード、文書、設定例、その他EncodeBridge固有の構成物に適用されます。
+
+作者の明示的な許可なく、以下の行為を禁止します。
+
+- EncodeBridgeまたはそのソースコードの再配布
+- 改変版の配布
+- 商用利用
+- EncodeBridgeの名称、画面、文書を用いた別製品・派生物の公開
+- 作者または公式配布元と誤認させる形での公開
+
+利用者は個人の検証、学習、動作確認の範囲でEncodeBridgeを使用できます。
+
+EncodeBridgeの使用により発生した録画データの欠損、変換失敗、出力ファイルの破損、設定データの破損、既存環境への影響、その他いかなる損害についても作者は責任を負いません。
+
+TvAIr Plugin SDK由来のコードについて
+
+`TvAIrPlugin/` 以下に同梱されるTvAIr Plugin SDK由来のコードには、本LICENSEではなくZIP直下の `SDK_LICENSE.txt` が適用されます。
+
+EncodeBridge本体とTvAIr Plugin SDK由来コードはライセンス適用範囲を分けて扱います。本LICENSEは `SDK_LICENSE.txt` を上書きせず、`SDK_LICENSE.txt` も本LICENSEを置き換えません。
+
+外部の変換アプリ、ライブラリ、その他第三者ソフトウェアについては、それぞれの配布元・権利者が定めるライセンスに従ってください。

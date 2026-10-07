@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Platforms>AnyCPU;x86;x64</Platforms>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>TvAIrPlugin</RootNamespace>
+    <AssemblyName>TvAIrPlugin</AssemblyName>
+    <Version>$(TvAIrPluginSdkVersion)</Version>
+    <FileVersion>$(TvAIrFileVersion)</FileVersion>
+    <AssemblyVersion>$(TvAIrPluginSdkAssemblyVersion)</AssemblyVersion>
+    <InformationalVersion>$(TvAIrPluginSdkVersion)</InformationalVersion>
+    <!-- TvAIr 1.0.0 を Plugin SDK の互換開始点とする。 -->
+    <OutputType>Library</OutputType>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Platform)'=='x86'">
+    <PlatformTarget>x86</PlatformTarget>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Platform)'=='x64'">
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+
+</Project>

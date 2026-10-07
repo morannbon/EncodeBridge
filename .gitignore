@@ -1,0 +1,10 @@
+.vs/
+bin/
+obj/
+package/
+*.user
+*.suo
+*.rsuser
+*.pdb
+*.log
+*.tmp

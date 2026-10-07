@@ -1,0 +1,9 @@
+﻿<Project>
+  <PropertyGroup>
+    <TvAIrFileVersion>1.2.4.0</TvAIrFileVersion>
+    <TvAIrPluginSdkVersion>1.1.14</TvAIrPluginSdkVersion>
+    <TvAIrPluginSdkAssemblyVersion>1.0.0.0</TvAIrPluginSdkAssemblyVersion>
+    <TvAIrDeveloperDiagnostics Condition="'$(TvAIrDeveloperDiagnostics)' == ''">false</TvAIrDeveloperDiagnostics>
+    <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);TVAIR_DEVELOPER_DIAGNOSTICS</DefineConstants>
+  </PropertyGroup>
+</Project>
