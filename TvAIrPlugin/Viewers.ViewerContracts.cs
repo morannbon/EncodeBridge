@@ -22,6 +22,11 @@ public sealed record TvAirViewerProfileDto
     public required string DisplayName { get; init; }
     public required bool IsAvailable { get; init; }
     public required bool IsDefault { get; init; }
+    /// <summary>
+    /// Available service display groups for this physical viewer. CATV requires an
+    /// explicitly configured CATV tuner. Its enabled BonDriver/ch2 routes can also advertise GR, BS or CS retransmissions. HYBRID does not imply CATV.
+    /// BS and CS can be reported individually for a configured BSCS tuner.
+    /// </summary>
     public required IReadOnlyList<string> BroadcastGroups { get; init; }
     public required string LogicalViewerSlotId { get; init; }
     /// <summary>TvAIr設定でこのViewerに割り当てられた各放送波内の実デバイス番号。</summary>
@@ -113,11 +118,14 @@ public sealed record TvAirViewerOperationDto
     public int? ForegroundAfterRetunePid { get; init; }
     public long? ForegroundFinalHwnd { get; init; }
     public int? ForegroundFinalPid { get; init; }
+    /// <summary>Legacy diagnostic. False is not evidence of unchanged focus when foreground handles are null.</summary>
     public bool ForegroundChanged { get; init; }
     public bool ChangedToTargetViewer { get; init; }
     public bool RestorationAttempted { get; init; }
     public bool RestorationSucceeded { get; init; }
+    /// <summary>Legacy diagnostic. True requires an observed preservation result. The current Host returns false with not_measured; this does not mean observed focus loss.</summary>
     public bool FocusPreserved { get; init; }
+    /// <summary>not_measured means focus was not observed. It is not a Viewer operation error; use OperationCompleted, HasWarning and ContinuationRecommended for operation outcomes.</summary>
     public string FocusPreserveFailureReason { get; init; } = string.Empty;
     /// <summary>True when the requested Viewer transition completed authoritatively.</summary>
     public bool OperationCompleted { get; init; }

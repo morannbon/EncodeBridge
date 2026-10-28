@@ -35,8 +35,10 @@ public interface ITvAirPluginContext
     ITvAirPluginStorageApi Storage { get; }
     ITvAirEventsApi Events { get; }
     ITvAirExternalJobsApi ExternalJobs { get; }
+    ITvAirPowerInhibitionApi PowerInhibition => throw new NotSupportedException("PowerInhibition requires Host Contract 1.1.17.");
     ITvAirHostsApi Hosts { get; }
     ITvAirPluginsApi Plugins { get; }
+    ITvAirPluginSelectionsApi PluginSelections { get; }
     ITvAirExternalLookupApi ExternalLookup { get; }
     ITvAirInternetAccessApi InternetAccess { get; }
 }
@@ -243,9 +245,42 @@ public sealed class TvAirRuleQueryDto
     public int? Limit { get; init; }
 }
 
+/// <summary>Plugin-owned user-selectable option. Host does not interpret its meaning.</summary>
+public sealed class TvAirPluginSelectionOptionDto
+{
+    public string SelectionId { get; init; } = string.Empty;
+    public string DisplayName { get; init; } = string.Empty;
+}
+
+/// <summary>Generic binding fixed to a reservation at creation time.</summary>
+public sealed class TvAirPluginSelectionBindingDto
+{
+    public string PluginId { get; init; } = string.Empty;
+    public string FeatureId { get; init; } = string.Empty;
+    public string SelectionId { get; init; } = string.Empty;
+}
+
+/// <summary>Current selection catalog published by the owning Plugin.</summary>
+public sealed class TvAirPluginSelectionFeatureDto
+{
+    public string PluginId { get; init; } = string.Empty;
+    public string FeatureId { get; init; } = string.Empty;
+    public string DisplayName { get; init; } = string.Empty;
+    public bool Enabled { get; init; }
+    public IReadOnlyList<TvAirPluginSelectionOptionDto> Options { get; init; } = Array.Empty<TvAirPluginSelectionOptionDto>();
+}
+
+/// <summary>Owner-scoped publication; PluginId is assigned by the Host, not by the caller.</summary>
+public interface ITvAirPluginSelectionsApi
+{
+    void Publish(string featureId, string displayName, bool enabled, IReadOnlyList<TvAirPluginSelectionOptionDto> options);
+    void Remove(string featureId);
+}
+
 public sealed class TvAirKeywordRuleDto
 {
     public int RuleId { get; init; }
+    public IReadOnlyList<TvAirPluginSelectionBindingDto> PluginBindings { get; init; } = Array.Empty<TvAirPluginSelectionBindingDto>();
     public string Name { get; init; } = string.Empty;
     public string Pattern { get; init; } = string.Empty;
     public string ExcludePattern { get; init; } = string.Empty;
@@ -691,6 +726,51 @@ public interface ITvAirRecordingFilesApi
 {
     IReadOnlyList<TvAirRecordingFileDto> List(TvAirRecordingFileQueryDto? query = null);
     TvAirRecordingFileDto? GetByReservationId(string reservationId);
+    /// <summary>1.1.16: durable file-release journal. Persist NextSequence only after processing the page.
+    /// Delivery is repeatable; consumers deduplicate by RecordingFileId. No size threshold is applied.</summary>
+    TvAirFinalizedRecordingFilePageDto ListFinalized(TvAirFinalizedRecordingFileQueryDto? query = null)
+        => throw new NotSupportedException("Requires Host Contract 1.1.16.");
+}
+
+public sealed class TvAirFinalizedRecordingFileQueryDto
+{
+    public string? JournalId { get; init; }
+    public string? AfterRecordingFileId { get; init; }
+    public long AfterSequence { get; init; }
+    public int Limit { get; init; } = 100;
+}
+
+public sealed record TvAirFinalizedRecordingFileDto
+{
+    public long Sequence { get; init; }
+    public string RecordingFileId { get; init; } = string.Empty;
+    public string ReservationId { get; init; } = string.Empty;
+    public string? RecoveryParentReservationId { get; init; }
+    public string RecoveryChainId { get; init; } = string.Empty;
+    public string ReservationSource { get; init; } = string.Empty;
+    public string ProgramTitle { get; init; } = string.Empty;
+    public string ServiceName { get; init; } = string.Empty;
+    public string FilePath { get; init; } = string.Empty;
+    /// <summary>Confirmed size, or null when unavailable. The consumer's size policy must check the actual readable file.</summary>
+    public long? SizeBytes { get; init; }
+    public bool FileReleased { get; init; }
+    /// <summary>Physical file state: Released (sink close proof), or WriterExited (writer exited without per-segment close proof; may also be a normal stop).
+    /// This is not reservation success. Existing RecordingResultFinalized.Succeeded remains authoritative.</summary>
+    public string Result { get; init; } = string.Empty;
+    public string EndReason { get; init; } = string.Empty;
+    public DateTimeOffset ReleasedAt { get; init; }
+    public IReadOnlyList<TvAirPluginSelectionBindingDto> PluginBindings { get; init; }
+        = Array.Empty<TvAirPluginSelectionBindingDto>();
+}
+
+public sealed class TvAirFinalizedRecordingFilePageDto
+{
+    public string JournalId { get; init; } = string.Empty;
+    public string? NextRecordingFileId { get; init; }
+    public IReadOnlyList<TvAirFinalizedRecordingFileDto> Items { get; init; }
+        = Array.Empty<TvAirFinalizedRecordingFileDto>();
+    public long NextSequence { get; init; }
+    public bool HasMore { get; init; }
 }
 
 public sealed class TvAirRecordingFileQueryDto
@@ -934,11 +1014,18 @@ public sealed class TvAirEpgRunResultDto
 /// <summary>Operational Host services by default. Set Enabled=false only when the plugin explicitly needs disabled .ch2 service metadata; disabled services never appear in ProgramGuide or operational Viewer/Reservation routes.</summary>
 public interface ITvAirChannelsApi
 {
+    /// <summary>
+    /// Enabled rows use the Host programme-guide channel inventory, independent of EPG presence
+    /// and available viewer profiles. BroadcastType is the displayed wave (GR/BS/CS/CATV),
+    /// not physical tuner capability. DisplayOrder is the global inventory position.
+    /// IsEnabled does not guarantee a selectable route for a requested viewer profile.
+    /// </summary>
     IReadOnlyList<TvAirServiceDto> ListServices(TvAirServiceQueryDto? query = null);
 }
 
 public sealed class TvAirServiceQueryDto
 {
+    /// <summary>Displayed wave GR/BS/CS/CATV. Legacy BSCS (BS/CS) and HYBRID (CATV) filter aliases are accepted.</summary>
     public string? BroadcastType { get; init; }
     public bool? Enabled { get; init; }
 }
@@ -1202,11 +1289,14 @@ public sealed class TvAirViewerOperationResultDto
     public int? ForegroundAfterRetunePid { get; init; }
     public long? ForegroundFinalHwnd { get; init; }
     public int? ForegroundFinalPid { get; init; }
+    /// <summary>Legacy diagnostic. False is not evidence of unchanged focus when foreground handles are null.</summary>
     public bool ForegroundChanged { get; init; }
     public bool ChangedToTargetViewer { get; init; }
     public bool RestorationAttempted { get; init; }
     public bool RestorationSucceeded { get; init; }
+    /// <summary>Legacy diagnostic. True requires an observed preservation result. The current Host returns false with not_measured; this does not mean observed focus loss.</summary>
     public bool FocusPreserved { get; init; }
+    /// <summary>not_measured means focus was not observed. It is not a Viewer operation error; use OperationCompleted, HasWarning and ContinuationRecommended for operation outcomes.</summary>
     public string FocusPreserveFailureReason { get; init; } = string.Empty;
     /// <summary>True when the requested Viewer transition completed authoritatively.</summary>
     public bool OperationCompleted { get; init; }
@@ -1596,6 +1686,7 @@ public enum TvAirEventType
     /// </summary>
     RecordingResultFinalized = 17,
     ViewerSessionChanged = 18,
+    /// <summary>Host-managed Runtime ToolWindowのShown/Hidden/Closing/Closed確定事実。</summary>
     RuntimeWindowLifecycleChanged = 19,
     PluginPermissionChanged = 20,
     ViewerReservationChanged = 21,
@@ -1629,6 +1720,7 @@ public sealed class TvAirEventDto
     public TvAirReservationSnapshotDto? AfterReservation { get; init; }
     public IReadOnlyList<string> ChangedFields { get; init; } = Array.Empty<string>();
     public TvAirRecordingResultDto? RecordingResult { get; init; }
+    public IReadOnlyList<TvAirPluginSelectionBindingDto> PluginBindings { get; init; } = Array.Empty<TvAirPluginSelectionBindingDto>();
     /// <summary>ExternalJobChanged のときだけ設定されるHost管理Jobの現在状態。</summary>
     public TvAirExternalJobDto? ExternalJob { get; init; }
     /// <summary>Host-managed Runtime ToolWindow のライフサイクル確定事実。RuntimeWindowLifecycleChanged のときだけ設定される。</summary>
@@ -1639,7 +1731,11 @@ public sealed class TvAirEventDto
 }
 
 
-/// <summary>Host が正本として観測した Runtime ToolWindow のライフサイクル事実。</summary>
+/// <summary>
+/// Hostが正本として観測したRuntime ToolWindowのライフサイクル事実。
+/// Hide/PreserveSessionで非表示になった場合はHidden、再表示はShown、Dispose終端はClosing→Closedとして配送される。
+/// Windowの表示状態とBackgroundExecutionの継続/停止は別契約であり、PluginはCloseBehavior/BackgroundExecutionと合わせて解釈する。
+/// </summary>
 public sealed class TvAirRuntimeWindowLifecycleDto
 {
     public string PluginId { get; init; } = string.Empty;
@@ -1707,6 +1803,13 @@ public sealed class TvAirRecordingResultDto
     public bool Succeeded { get; init; }
 }
 
+/// <summary>
+/// Host管理の外部ジョブ。実行プロセスと実行中の子プロセスの停止はHostが所有する。
+/// Host通常終了・設定再起動では受付を閉じ、実行中ジョブを取消し、終了と出力読取の完了を
+/// 上限付きで待機する。PluginはHost終了のためだけにCancelを呼ぶ必要はない。
+/// CancelはPlugin自身による個別取消要求であり、trueは停止完了ではなく要求受付を示す。
+/// OSによる強制終了・クラッシュ時の自動復旧/再投入はこの契約に含まない。
+/// </summary>
 public interface ITvAirExternalJobsApi
 {
     TvAirExternalJobDto Enqueue(TvAirExternalJobRequestDto request);

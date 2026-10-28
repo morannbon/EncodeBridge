@@ -1,10 +1,12 @@
 ﻿using System.Text.Json;
+using System.Text.Json.Serialization;
+using TvAIrPlugin;
 
 namespace EncodeBridge.Domain;
 
 internal static class EncodeBridgeDefaults
 {
-    public const int SchemaVersion = 1;
+    public const int SchemaVersion = 2;
     public const bool AutoEncodeEnabled = false;
     public const int MaxConcurrentEncodes = 1;
     public const bool PauseStartWhileRecording = true;
@@ -12,6 +14,7 @@ internal static class EncodeBridgeDefaults
     public const int MinimumFreeSpaceGb = 10;
     public const int HistoryRetentionDays = 30;
     public const string DefaultContainer = "mkv";
+    public const int MaxPostEncodeBatchLength = 32768;
 }
 
 internal enum EncodeToolKind { Ffmpeg, NvEncC, QsvEncC, VceEncC, HandBrake, Amatsukaze, TmpgEnc, Custom }
@@ -27,6 +30,7 @@ internal enum QualityPreset { High, Standard, Compact }
 internal sealed class EncodeBridgeSettings
 {
     public bool AutoEncodeEnabled { get; set; } = EncodeBridgeDefaults.AutoEncodeEnabled;
+    public bool PostEncodeBatchRiskAccepted { get; set; }
     public int MaxConcurrentEncodes { get; set; } = EncodeBridgeDefaults.MaxConcurrentEncodes;
     public bool PauseStartWhileRecording { get; set; } = EncodeBridgeDefaults.PauseStartWhileRecording;
     public bool PauseStartWhileEpg { get; set; } = EncodeBridgeDefaults.PauseStartWhileEpg;
@@ -60,6 +64,9 @@ internal sealed class EncodeProfile
     public string SourceSubdirectoryName { get; set; } = "Encoded";
     public Dictionary<string, string> AdapterSettings { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public List<string> AdditionalArguments { get; set; } = new();
+    public string PostEncodeBatch { get; set; } = string.Empty;
+    public bool PostEncodeBatchEnabled { get; set; }
+    public bool PostEncodeBatchRiskAccepted { get; set; }
 }
 
 internal sealed class EncodeRule
@@ -75,6 +82,7 @@ internal sealed class EncodeRule
 internal sealed class RecordingSnapshot
 {
     public string RecordingId { get; set; } = string.Empty;
+    public string RecordingFileId { get; set; } = string.Empty;
     public string ReservationId { get; set; } = string.Empty;
     public string SourceFilePath { get; set; } = string.Empty;
     public ushort NetworkId { get; set; }
@@ -109,6 +117,9 @@ internal sealed class EncodeProfileSnapshot
     public string SourceSubdirectoryName { get; set; } = "Encoded";
     public Dictionary<string, string> AdapterSettings { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public List<string> AdditionalArguments { get; set; } = new();
+    public string PostEncodeBatch { get; set; } = string.Empty;
+    public bool PostEncodeBatchEnabled { get; set; }
+    public bool PostEncodeBatchRiskAccepted { get; set; }
 }
 
 internal sealed class EncodeQueueItem
@@ -117,6 +128,10 @@ internal sealed class EncodeQueueItem
     public RecordingSnapshot Recording { get; set; } = new();
     public EncodeProfileSnapshot Profile { get; set; } = new();
     public EncodeQueueState State { get; set; } = EncodeQueueState.Waiting;
+    // Durable proof that the current automatic-admission policy was applied before queueing.
+    // Retain the existing JSON property name to preserve compatibility with persisted settings.
+    [JsonPropertyName("explicitReservationBindingVerified")]
+    public bool AdmissionPolicyVerified { get; set; }
     public int AttemptNumber { get; set; } = 1;
     public string ClientRequestId { get; set; } = string.Empty;
     public string ExternalJobId { get; set; } = string.Empty;
@@ -127,6 +142,8 @@ internal sealed class EncodeQueueItem
     public string LastError { get; set; } = string.Empty;
     public string? PreparedArtifactPath { get; set; }
     public bool HandoffOnly { get; set; }
+    public bool PostEncodeBatchRunning { get; set; }
+    public string PostEncodeBatchFilePath { get; set; } = string.Empty;
 }
 
 internal sealed class EncodeHistoryItem
@@ -159,7 +176,12 @@ internal sealed class EncodeBridgeStore
     public List<EncodeRule> Rules { get; set; } = new();
     public List<EncodeQueueItem> Queue { get; set; } = new();
     public List<EncodeHistoryItem> History { get; set; } = new();
-    public HashSet<string> ProcessedRecordingIds { get; set; } = new(StringComparer.Ordinal);
+    public HashSet<string> ProcessedRecordingIds { get; set; } = new(StringComparer.Ordinal); // legacy; retained for saved-data compatibility
+    public HashSet<string> ProcessedRecordingFileIds { get; set; } = new(StringComparer.Ordinal);
+    public List<TvAirFinalizedRecordingFileDto> PendingFinalizedFiles { get; set; } = new();
+    public string? FinalizedJournalId { get; set; }
+    public long FinalizedNextSequence { get; set; }
+    public string? FinalizedNextRecordingFileId { get; set; }
 }
 
 internal sealed record ExternalProcessPlan(string ExecutablePath, IReadOnlyList<string> Arguments, string? WorkingDirectory, string ExpectedOutputPath, bool HandoffOnly, string? PreparedArtifactPath = null);

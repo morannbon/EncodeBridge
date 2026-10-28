@@ -50,6 +50,13 @@ internal sealed class EncodeBridgeStorage
     private static EncodeBridgeStore Migrate(EncodeBridgeStore store)
     {
         if (store.SchemaVersion == EncodeBridgeDefaults.SchemaVersion) return store;
+        if (store.SchemaVersion == 1)
+        {
+            foreach (var profile in store.Profiles)
+                profile.PostEncodeBatchRiskAccepted = profile.PostEncodeBatchEnabled && store.Settings.PostEncodeBatchRiskAccepted;
+            store.SchemaVersion = EncodeBridgeDefaults.SchemaVersion;
+            return store;
+        }
         throw new InvalidDataException($"未対応の保存形式です: {store.SchemaVersion}");
     }
 

@@ -8,3 +8,5 @@ package/
 *.pdb
 *.log
 *.tmp
+
+/package/

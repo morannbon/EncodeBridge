@@ -1,0 +1,8 @@
+{
+  "Name": "EncodeBridge",
+  "Solution": "EncodeBridge.sln",
+  "Dll": "EncodeBridge.dll",
+  "Version": "1.0.1",
+  "Project": "EncodeBridge",
+  "Framework": "net8.0-windows"
+}
