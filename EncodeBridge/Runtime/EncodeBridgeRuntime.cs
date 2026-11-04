@@ -12,12 +12,13 @@ namespace EncodeBridge.Runtime;
 
 internal sealed class EncodeBridgeRuntime : IDisposable
 {
-    private readonly ITvAirPluginRuntimeContext _ctx; private readonly EncodeBridgeStorage _storage; private readonly RuleResolver _rules=new(); private readonly EncodeScheduler _scheduler; private readonly EncodeBridgePowerGuard _powerGuard; private readonly List<IDisposable> _subs=new(); private readonly object _gate=new();
-    private sealed class UiWindowRefreshState
-    {
-        public string LogicalContentRoute { get; set; } = "/plugin/encodebridge";
-        public long NextRefreshTick { get; set; }
-    }
+    private readonly ITvAirPluginRuntimeContext _ctx;
+    private readonly EncodeBridgeStorage _storage;
+    private readonly EncodeScheduler _scheduler;
+    private readonly EncodeBridgePowerGuard _powerGuard;
+    private readonly List<IDisposable> _subs = new();
+    private readonly object _gate = new();
+    private const string UiContentRoute = "/plugin/encodebridge";
 
     private readonly ManualResetEventSlim _filePollStop = new(false);
     private readonly AutoResetEvent _filePollWake = new(false);
@@ -26,10 +27,25 @@ internal sealed class EncodeBridgeRuntime : IDisposable
     // Protected between synchronous finalized callback and durable journal admission.
     // Keyed by the Host reservation identity; never start an encoder from this event.
     private readonly HashSet<string> _admissionLeaseIds = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _completedAdmissionIds = new(StringComparer.OrdinalIgnoreCase);
+    // Admission decisions are recorded after the journal cursor/queue transaction is durable.
+    // A reservation can produce more than one file; never suppress by reservation alone.
+    private readonly Dictionary<string, List<(string Path, DateTimeOffset ReleasedAt)>> _durableAdmissionDecisions =
+        new(StringComparer.OrdinalIgnoreCase);
+    private const int MaxAdmissionDecisions = 4096;
+    // The callback correlation cache is session-local and insertion ordered.
+    // Eviction is constant-time instead of rescanning and sorting all entries
+    // after each finalized recording during a long-running session.
+    private readonly Queue<(string ReservationId, string Path, DateTimeOffset ReleasedAt)> _admissionDecisionOrder = new();
+    // Exact filenames supported by a Host finalization or failed-recording
+    // notification in THIS session; actual released-file journal still required.
+    // A recovered partial TS can have ReleasedAt before plugin startup, while its
+    // authoritative failure/finalization notification arrives after startup.
+    // Never treat all previous-session journal entries as eligible for replay.
+    private readonly HashSet<string> _newlyFinalizedPriorSessionPaths = new(StringComparer.OrdinalIgnoreCase);
+    private static string FinalizationKey(string reservationId, string path) =>
+        reservationId + "\n" + Path.GetFullPath(path);
     private bool _disposing;
     public string FileJournalError { get; private set; } = string.Empty;
-    private const long MinRecordingBytes = 1024L * 1024L;
     private const int FilePollIntervalMs = 15000;
     // Only files finalized after this plugin session started may be admitted.
     private DateTimeOffset _sessionStartedAt;
@@ -37,7 +53,7 @@ internal sealed class EncodeBridgeRuntime : IDisposable
     private const int UiRefreshIdleDelayMs = 60_000;
 
     private static long NextUiRefreshTick() => Environment.TickCount64 + UiRefreshIdleDelayMs;
-    private readonly object _uiRefreshGate=new(); private readonly Dictionary<string,UiWindowRefreshState> _uiWindows=new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _uiRefreshGate=new(); private readonly Dictionary<string,long> _uiWindows=new(StringComparer.OrdinalIgnoreCase);
     private readonly ManualResetEventSlim _uiRefreshStop=new(false); private readonly AutoResetEvent _uiRefreshScheduleChanged=new(false); private Thread? _uiRefreshThread; private int _uiRefreshInProgress;
     private long _uiRefreshTickSequence;
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
@@ -62,40 +78,17 @@ internal sealed class EncodeBridgeRuntime : IDisposable
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
         WriteDeveloperDiagnostic($"ENCODEBRIDGE_STATE_LOAD storageHealthy={StorageHealthy} tools={Store.Tools.Count} profiles={Store.Profiles.Count} rules={Store.Rules.Count} queue={Store.Queue.Count} history={Store.History.Count} auto={Store.Settings.AutoEncodeEnabled}");
 #endif
-        // Startup is a new execution boundary. Never resume, replay or post-process work
-        // left by a previous process. Existing TS/MP4/staging files are left untouched.
+        // Recover only never-dispatched waits. A prior dispatch is reconciled
+        // from explicit durable progress/job evidence, not from output filename.
+        // Never auto-relaunch an encoder which might already have run.
         _sessionStartedAt = DateTimeOffset.Now;
         if (StorageHealthy)
         {
-            var abandoned = Store.Queue.ToArray();
-            foreach (var item in abandoned)
-            {
-                Store.History.Add(new EncodeHistoryItem
-                {
-                    QueueItemId = item.QueueItemId,
-                    RecordingId = item.Recording.RecordingId,
-                    Title = item.Recording.Title,
-                    ServiceName = item.Recording.ServiceName,
-                    ActualStart = item.Recording.ActualStart,
-                    SourceFilePath = item.Recording.SourceFilePath,
-                    OutputFilePath = item.ExpectedOutputPath,
-                    ProfileName = item.Profile.ProfileName,
-                    ToolName = item.Profile.ToolName,
-                    Result = EncodeQueueState.Stopped,
-                    StartedAt = item.StartedAt,
-                    FinishedAt = _sessionStartedAt,
-                    AttemptNumber = item.AttemptNumber,
-                    FailureMessage = "前回の実行は中断されました。自動再開しません。",
-                    Recording = item.Recording,
-                    Profile = item.Profile
-                });
-            }
-            Store.Queue.Clear();
-            var pendingCount = Store.PendingFinalizedFiles.Count;
-            Store.PendingFinalizedFiles.Clear();
-            if (abandoned.Length > 0 || pendingCount > 0) _storage.Save(Store);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-            WriteDeveloperDiagnostic($"ENCODEBRIDGE_STARTUP_RECOVERY result=ABANDONED queue={abandoned.Length} pending={pendingCount} policy=no_auto_resume sessionStart={_sessionStartedAt:O}");
+            var recovered = _scheduler.RecoverPreviousSessionQueue(_sessionStartedAt);
+            WriteDeveloperDiagnostic($"ENCODEBRIDGE_STARTUP_RECOVERY result=RECONCILED resolved={recovered} waiting={Store.Queue.Count(x => x.State == EncodeQueueState.Waiting)} pendingPreserved={Store.PendingFinalizedFiles.Count} policy=only_unstarted_waits_resume sessionStart={_sessionStartedAt:O}");
+#else
+            _scheduler.RecoverPreviousSessionQueue(_sessionStartedAt);
 #endif
         }
         _subs.Add(_ctx.Events.Subscribe(nameof(TvAirEventType.RecordingResultFinalized), OnRecordingResultFinalized));
@@ -103,7 +96,7 @@ internal sealed class EncodeBridgeRuntime : IDisposable
         // RecordingFiles.ListFinalized is the only new-file admission route.
         // Completion/failure events are scheduler wake-ups only for existing queue items.
         _subs.Add(_ctx.Events.Subscribe(nameof(TvAirEventType.RecordingCompleted), _ => EvaluateIfStorageHealthy()));
-        _subs.Add(_ctx.Events.Subscribe(nameof(TvAirEventType.RecordingFailed), _ => EvaluateIfStorageHealthy()));
+        _subs.Add(_ctx.Events.Subscribe(nameof(TvAirEventType.RecordingFailed), OnRecordingFailed));
         _subs.Add(_ctx.Events.Subscribe(nameof(TvAirEventType.EpgCompleted), _ => EvaluateIfStorageHealthy()));
         _subs.Add(_ctx.Events.Subscribe(nameof(TvAirEventType.RuntimeWindowLifecycleChanged), OnRuntimeWindowLifecycleChanged));
         PublishProfileSelections();
@@ -133,7 +126,11 @@ internal sealed class EncodeBridgeRuntime : IDisposable
         {
             lock (_gate)
             {
-                if (!_disposing && !_admissionLeaseIds.Contains(reservationId) && !_completedAdmissionIds.Contains(reservationId))
+                // Mark this specific old-session file only when the Host newly finalized
+                // it in the current session. The journal is still the admission authority.
+                if (!string.IsNullOrWhiteSpace(result!.FilePath))
+                    _newlyFinalizedPriorSessionPaths.Add(FinalizationKey(reservationId!, result.FilePath));
+                if (!_disposing && !_admissionLeaseIds.Contains(reservationId) && !HasDurableAdmissionDecision(result!))
                 {
                     // Acquire before callback returns: Host releases recording lease after dispatch.
                     // Failure must propagate, not be reported as successful power handoff.
@@ -149,32 +146,94 @@ internal sealed class EncodeBridgeRuntime : IDisposable
         try { _filePollWake.Set(); } catch (ObjectDisposedException) { }
     }
 
+    private void OnRecordingFailed(PluginEventEnvelope envelope)
+    {
+        // Startup recovery can emit RecordingFailed without a second
+        // RecordingResultFinalized event. Treat it strictly as file-specific
+        // admission evidence, not as proof that a file was released.
+        // ListFinalized(FileReleased=true) is still the ONLY encoding source.
+        var result = (envelope.Payload as TvAirEventDto)?.RecordingResult;
+        if (!_disposing && StorageHealthy && Store.Settings.AutoEncodeEnabled &&
+            result?.FileCreated == true &&
+            !IsExplicitManualRecordingStop(result.EndReason) &&
+            !string.IsNullOrWhiteSpace(result.ReservationId) &&
+            !string.IsNullOrWhiteSpace(result.FilePath))
+        {
+            lock (_gate)
+                _newlyFinalizedPriorSessionPaths.Add(FinalizationKey(result.ReservationId, result.FilePath));
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+            WriteDeveloperDiagnostic($"ENCODEBRIDGE_RECOVERY_EVIDENCE result=OBSERVED journalRequired=True");
+#endif
+        }
+        // Failure notifications do not acquire Admission power leases: unlike
+        // RecordingResultFinalized, they are not a file-release handoff boundary.
+        try { _filePollWake.Set(); } catch (ObjectDisposedException) { }
+        EvaluateIfStorageHealthy();
+    }
+
+    private bool HasDurableAdmissionDecision(TvAirRecordingResultDto result)
+    {
+        // The callback and journal expose distinct recording IDs, but agree on the
+        // reservation, actual file path and recording end. Avoid suppressing a later
+        // occurrence of a recurring reservation which writes a new file.
+        if (string.IsNullOrWhiteSpace(result.FilePath) ||
+            !_durableAdmissionDecisions.TryGetValue(result.ReservationId, out var files)) return false;
+        return files.Any(file =>
+            string.Equals(file.Path, result.FilePath, StringComparison.OrdinalIgnoreCase) &&
+            result.ActualEndTime.HasValue &&
+            Math.Abs((file.ReleasedAt - result.ActualEndTime.Value).TotalMinutes) < 5);
+    }
+
     private void CompleteAdmission(TvAirFinalizedRecordingFileDto file)
     {
-        if (!string.IsNullOrWhiteSpace(file.ReservationId) && _admissionLeaseIds.Contains(file.ReservationId))
+        // Called ONLY after successful durable storage commit. The decision must be
+        // visible to late typed callbacks even when no admission lease was ever held.
+        if (string.IsNullOrWhiteSpace(file.ReservationId)) return;
+        if (!string.IsNullOrWhiteSpace(file.FilePath))
+        {
+            if (!_durableAdmissionDecisions.TryGetValue(file.ReservationId, out var files))
+            {
+                files = new List<(string Path, DateTimeOffset ReleasedAt)>();
+                _durableAdmissionDecisions.Add(file.ReservationId, files);
+            }
+            if (!files.Any(x => string.Equals(x.Path, file.FilePath, StringComparison.OrdinalIgnoreCase) && x.ReleasedAt == file.ReleasedAt))
+            {
+                files.Add((file.FilePath, file.ReleasedAt));
+                _admissionDecisionOrder.Enqueue((file.ReservationId, file.FilePath, file.ReleasedAt));
+            }
+            // The journal cursor remains the durable source of truth. Only
+            // callback correlation state is evicted; never touch queued work.
+            while (_admissionDecisionOrder.Count > MaxAdmissionDecisions)
+            {
+                var oldest = _admissionDecisionOrder.Dequeue();
+                if (!_durableAdmissionDecisions.TryGetValue(oldest.ReservationId, out var oldFiles)) continue;
+                oldFiles.RemoveAll(x => string.Equals(x.Path, oldest.Path, StringComparison.OrdinalIgnoreCase) && x.ReleasedAt == oldest.ReleasedAt);
+                if (oldFiles.Count == 0) _durableAdmissionDecisions.Remove(oldest.ReservationId);
+            }
+        }
+        if (_admissionLeaseIds.Remove(file.ReservationId))
         {
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
             _powerGuard.ReleaseAdmission(file.ReservationId, "journal_decision");
 #else
             _powerGuard.ReleaseAdmission(file.ReservationId);
 #endif
-            _admissionLeaseIds.Remove(file.ReservationId);
-            _completedAdmissionIds.Add(file.ReservationId);
         }
     }
 
-    // SDK 1.1.16: durable journal is the sole new-recording admission route.
-    // The legacy event is only a wake-up, because journal import is asynchronous.
+    // Only the durable finalized-file journal admits media. Recording events wake the
+    // poller and provide file-specific recovery evidence; they never enqueue media.
     private void FinalizedFilePollLoop()
     {
+        var waitHandles = new WaitHandle[] { _filePollStop.WaitHandle, _filePollWake };
         while (!_filePollStop.IsSet)
         {
             try { PollFinalizedFiles(); }
-            #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
-            #else
+#else
             catch (Exception)
-            #endif
+#endif
             {
                 // On unexpected journal/storage failures, stop instead of risking an in-memory cursor skip.
                 _fileJournalBlocked = true;
@@ -190,12 +249,12 @@ internal sealed class EncodeBridgeRuntime : IDisposable
                     }
                     _admissionLeaseIds.Clear();
                 }
-                FileJournalError = "録画ファイル確定台帳の取得を停止しました。保存状態とHost Contract 1.1.18を確認してください。";
+                FileJournalError = "録画ファイルを確認できません。TvAIrを再起動してください。";
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperDiagnostic($"ENCODEBRIDGE_FINALIZED_POLL result=BLOCKED type={ex.GetType().Name} message={DiagnosticQuote(ex.Message)} cursor={Store.FinalizedNextSequence}");
 #endif
             }
-            if (WaitHandle.WaitAny(new[] { _filePollStop.WaitHandle, _filePollWake }, FilePollIntervalMs) == 0) break;
+            if (WaitHandle.WaitAny(waitHandles, FilePollIntervalMs) == 0) break;
         }
     }
 
@@ -245,11 +304,16 @@ internal sealed class EncodeBridgeRuntime : IDisposable
                 {
                     if (file.Sequence <= Store.FinalizedNextSequence || string.IsNullOrWhiteSpace(file.RecordingFileId) || !file.FileReleased)
                         throw new InvalidDataException("Invalid finalized recording file entry or sequence.");
-                    // Past sessions are never replayed, even when the Host journal cursor
-                    // points before this startup. Still advance the durable cursor normally.
-                    if (file.ReleasedAt <= _sessionStartedAt)
+                    // Previous-session files are normally excluded. The sole exception
+                    // is a concrete file newly reported by the Host in this session
+                    // (e.g. startup recovery of a partial TS). No blanket replay.
+                    var newlyFinalizedRecovery = file.ReleasedAt <= _sessionStartedAt &&
+                        !string.IsNullOrWhiteSpace(file.FilePath) &&
+                        _newlyFinalizedPriorSessionPaths.Contains(FinalizationKey(file.ReservationId, file.FilePath));
+                    if (file.ReleasedAt <= _sessionStartedAt && !newlyFinalizedRecovery)
                     {
                         MarkFinalizedFileProcessed(file.RecordingFileId);
+                        completedFiles.Add(file);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
                         WriteDeveloperDiagnostic($"ENCODEBRIDGE_FILE_DECISION result=SKIPPED reason=previous_session fileId={file.RecordingFileId}");
 #endif
@@ -287,7 +351,12 @@ internal sealed class EncodeBridgeRuntime : IDisposable
                     Store.FinalizedNextSequence = page.NextSequence;
                     Store.FinalizedNextRecordingFileId = page.NextRecordingFileId;
                     _storage.Save(Store); // atomic queue / deferral / skip / cursor storage transaction
-                    foreach (var completed in completedFiles) CompleteAdmission(completed);
+                    foreach (var completed in completedFiles)
+                    {
+                        CompleteAdmission(completed);
+                        if (!string.IsNullOrWhiteSpace(completed.FilePath))
+                            _newlyFinalizedPriorSessionPaths.Remove(FinalizationKey(completed.ReservationId, completed.FilePath));
+                    }
                 }
                 _scheduler.Evaluate();
                 if (!page.HasMore) return;
@@ -335,8 +404,7 @@ internal sealed class EncodeBridgeRuntime : IDisposable
             MarkFinalizedFileProcessed(file.RecordingFileId);
             return true;
         }
-        // The Host journal EndReason can be empty or generic even when the actual
-        // reservation terminal state is Cancelled (confirmed on 2026-10-25).
+        // The journal end reason is not sufficient to identify a cancelled reservation.
         // Resolve authoritative reservation metadata BEFORE any automatic admission,
         // including journal replay after restart and deferred retry. Missing metadata
         // stays pending, rather than converting a potentially user-stopped recording.
@@ -363,23 +431,9 @@ internal sealed class EncodeBridgeRuntime : IDisposable
             string.Equals(x.PluginId, "encodebridge", StringComparison.OrdinalIgnoreCase) &&
             string.Equals(x.FeatureId, "encode-profile", StringComparison.OrdinalIgnoreCase)).ToArray();
         var isKeywordReservation = string.Equals(file.ReservationSource, "Keyword", StringComparison.OrdinalIgnoreCase);
-        // 【Host担当者向け・予約種別別の適用契約（変更禁止）】
-        // (1) 「自動検索予約」だけが個別オプトイン方式。Hostが渡す ReservationSource == "Keyword"
-        //     で判定し、当該自動検索ルールで「EncodeBridgeを利用」がチェック済み、かつ
-        //     そのルールの「変換プロファイル」が選択済みのときだけ変換する。
-        //     Hostから encodebridge / encode-profile の PluginBinding が正確に1件届き、
-        //     SelectionId が空でないことが両条件成立の証拠。チェックなし・選択なし・
-        //     重複Bindingはすべて SKIP。デフォルト設定で穴埋めしてはならない。
-        // (2) 自動検索「以外」は通常予約。番組表、AI-rhythm、プログラム予約、今すぐ録画、
-        //     source=Manual 等は「EncodeBridgeを利用」の個別チェックを要求しない。
-        //     EncodeBridge全体の自動変換ONおよび通常の対象判定を満たせば、
-        //     EncodeBridgeのデフォルトプロファイルに従って変換する。
-        //     source=Manual はAI-rhythm専用の意味ではない。
-        // (3) Hostは自動検索ルール専用のPluginBindingを通常予約へコピーしてはならない。
-        //     UI上のオプトイン設定は自動検索ルールにのみ適用し、通常予約の変換を
-        //     Binding欠如を理由にスキップしないこと。
-        // ※ この分岐は予約種別と変換プロファイルの選択規則。サイズ1MB以上、
-        //    手動録画停止除外、重複除外、全体自動変換OFF等の共通条件は別途適用される。
+        // Automatic-search recordings require exactly one explicit selected binding;
+        // every other reservation source uses the enabled default profile. Manual
+        // recording stops, insufficient files and automatic-OFF are separate gates.
         if (isKeywordReservation && (bindings.Length != 1 || string.IsNullOrWhiteSpace(bindings[0].SelectionId)))
         {
             MarkFinalizedFileProcessed(file.RecordingFileId);
@@ -400,7 +454,7 @@ internal sealed class EncodeBridgeRuntime : IDisposable
         }
         catch (IOException) { return false; }
         catch (UnauthorizedAccessException) { return false; }
-        if (size < MinRecordingBytes)
+        if (size < EncodeBridgeDefaults.MinRecordingBytes)
         {
             MarkFinalizedFileProcessed(file.RecordingFileId);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
@@ -408,22 +462,17 @@ internal sealed class EncodeBridgeRuntime : IDisposable
 #endif
             return true;
         }
-        // Migration safeguard: a file already enqueued by pre-1.1.16 event handling is not converted twice.
-        if (Store.Queue.Any(x => string.Equals(x.Recording.SourceFilePath, file.FilePath, StringComparison.OrdinalIgnoreCase)) ||
-            Store.History.Any(x => string.Equals(x.SourceFilePath, file.FilePath, StringComparison.OrdinalIgnoreCase)))
+        // Physical source identity prevents duplicate conversion even when journal
+        // identities differ across a recording's finalization events.
+        if (Store.Queue.Any(x => RecordingFileIdentity.SameSourcePath(x.Recording.SourceFilePath, file.FilePath)) ||
+            Store.History.Any(x => RecordingFileIdentity.SameSourcePath(x.SourceFilePath, file.FilePath)))
         {
             MarkFinalizedFileProcessed(file.RecordingFileId);
             return true;
         }
-        // 【プロファイル決定】自動検索（ReservationSource == Keyword）のみ、そのルールが
-        // 明示選択したBinding.SelectionIdと一致する有効プロファイルを使用する。
-        // 無効・削除済み等で見つからなければSKIP。デフォルトにはフォールバックしない。
-        // 自動検索以外（Manualを含む）はBindingに関係なくデフォルトを使用する。
-        var profile = isKeywordReservation
-            ? Store.Profiles.FirstOrDefault(x => x.Enabled &&
-                string.Equals(x.ProfileId, bindings[0].SelectionId, StringComparison.OrdinalIgnoreCase))
-            : _rules.Resolve(Store, rec);
-        var tool = profile is null ? null : Store.Tools.FirstOrDefault(x => x.ToolId == profile.ToolId);
+        var profile = EncodeProfilePolicy.ResolveForRecording(Store, isKeywordReservation,
+            isKeywordReservation ? bindings[0].SelectionId : null);
+        var tool = EncodeProfilePolicy.ResolveTool(Store, profile?.ToolId);
         if (tool is null || profile is null || string.IsNullOrWhiteSpace(tool.ExecutablePath))
         {
             // Persist the unavailable configured profile decision without guessing an alternative profile.
@@ -433,25 +482,10 @@ internal sealed class EncodeBridgeRuntime : IDisposable
 #endif
             return true;
         }
-        var snap = new EncodeProfileSnapshot
-        {
-            ProfileId = profile.ProfileId, ProfileName = ProfileDisplay.Label(Store, profile),
-            ToolId = tool.ToolId, ToolKind = tool.Kind, ToolName = tool.DisplayName,
-            ExecutablePath = tool.ExecutablePath, VideoCodec = profile.VideoCodec,
-            Quality = profile.Quality, AudioTracks = profile.AudioTracks, AudioCodec = profile.AudioCodec,
-            Subtitles = profile.Subtitles, Container = profile.Container,
-            OutputDirectoryMode = profile.OutputDirectoryMode, OutputDirectory = profile.OutputDirectory,
-            SourceSubdirectoryName = profile.SourceSubdirectoryName,
-            AdapterSettings = new(profile.AdapterSettings, StringComparer.OrdinalIgnoreCase),
-            AdditionalArguments = new(profile.AdditionalArguments),
-            PostEncodeBatch = profile.PostEncodeBatch,
-            PostEncodeBatchEnabled = profile.PostEncodeBatchEnabled && profile.PostEncodeBatchRiskAccepted,
-            PostEncodeBatchRiskAccepted = profile.PostEncodeBatchRiskAccepted
-        };
-        foreach (var kv in tool.Settings) snap.AdapterSettings.TryAdd(kv.Key, kv.Value);
+        var snap = EncodeProfileSnapshotFactory.Create(Store, profile, tool);
         // Keep resident queued work bounded; excess journal records remain durably deferred.
         if (Store.Queue.Count >= 256) return false;
-        var queueItem = new EncodeQueueItem { Recording = rec, Profile = snap, AdmissionPolicyVerified = true };
+        var queueItem = new EncodeQueueItem { Recording = rec, Profile = snap };
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
         _powerGuard.Acquire(queueItem.QueueItemId, "FinalizedFileJournal");
 #else
@@ -470,20 +504,9 @@ internal sealed class EncodeBridgeRuntime : IDisposable
         cancelledAfterStart = false;
         try
         {
-            var reservation = _ctx.Reservations.Get(file.ReservationId);
-            if (reservation is null)
-                reservation = _ctx.Reservations.ListHistory(new TvAirReservationHistoryQueryDto
-                {
-                    ReservationId = file.ReservationId, Limit = 1
-                }).FirstOrDefault(x => string.Equals(x.ReservationId, file.ReservationId, StringComparison.OrdinalIgnoreCase));
+            var reservation = FindReservation(file.ReservationId);
             if (reservation is null && !string.IsNullOrWhiteSpace(file.RecoveryParentReservationId))
-            {
-                reservation = _ctx.Reservations.Get(file.RecoveryParentReservationId) ??
-                    _ctx.Reservations.ListHistory(new TvAirReservationHistoryQueryDto
-                    {
-                        ReservationId = file.RecoveryParentReservationId, Limit = 1
-                    }).FirstOrDefault(x => string.Equals(x.ReservationId, file.RecoveryParentReservationId, StringComparison.OrdinalIgnoreCase));
-            }
+                reservation = FindReservation(file.RecoveryParentReservationId);
             if (reservation is null || reservation.ServiceId <= 0 || reservation.ServiceId > ushort.MaxValue)
                 return false;
             // A finalized file whose reservation has terminal status Cancelled
@@ -500,17 +523,26 @@ internal sealed class EncodeBridgeRuntime : IDisposable
             rec.ActualStart = reservation.RecordingStartedAt;
             return true;
         }
-        #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
-        #else
+#else
         catch (Exception)
-        #endif
+#endif
         {
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
             WriteDeveloperDiagnostic($"ENCODEBRIDGE_FILE_METADATA result=DEFERRED service={DiagnosticQuote(file.ServiceName)} title={DiagnosticQuote(file.ProgramTitle)} error={ex.GetType().Name}");
 #endif
             return false;
         }
+    }
+
+    private TvAirReservationDto? FindReservation(string reservationId)
+    {
+        return _ctx.Reservations.Get(reservationId) ??
+            _ctx.Reservations.ListHistory(new TvAirReservationHistoryQueryDto
+            {
+                ReservationId = reservationId, Limit = 1
+            }).FirstOrDefault(x => string.Equals(x.ReservationId, reservationId, StringComparison.OrdinalIgnoreCase));
     }
 
     public void PublishProfileSelections()
@@ -526,7 +558,7 @@ internal sealed class EncodeBridgeRuntime : IDisposable
             .Select(x => new
             {
                 Profile = x,
-                Tool = Store.Tools.FirstOrDefault(t => string.Equals(t.ToolId, x.ToolId, StringComparison.OrdinalIgnoreCase))
+                Tool = EncodeProfilePolicy.ResolveTool(Store, x.ToolId)
             })
             .Where(x => x.Tool is not null)
             .Select(x => new TvAirPluginSelectionOptionDto
@@ -537,11 +569,8 @@ internal sealed class EncodeBridgeRuntime : IDisposable
             .OrderBy(x => x.DisplayName, StringComparer.CurrentCultureIgnoreCase)
             .ThenBy(x => x.SelectionId, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        // 【Host向けUI契約】この選択肢は「自動検索ルールの個別設定」のために公開する。
-        // 自動検索ルールではチェックON＋ここからのプロファイル選択の両方が必須。
-        // 通常予約（番組表・AI-rhythm・プログラム予約・今すぐ録画等）にこのチェック欄を
-        // 追加したり、未選択を理由に通常予約をスキップしたりしてはならない。
-        // 通常予約はEncodeBridge内のデフォルト設定で自動変換する。
+        // These options configure automatic-search bindings only. Other reservation
+        // sources use the default profile without an individual opt-in switch.
         var enabled = Store.Settings.AutoEncodeEnabled && options.Length > 0;
         _ctx.PluginSelections.Publish("encode-profile", "変換プロファイル", enabled, options);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
@@ -620,6 +649,9 @@ internal sealed class EncodeBridgeRuntime : IDisposable
     }
 #endif
 
+    // Called only while holding _uiRefreshGate.
+    private void ScheduleUiRefreshLocked(string windowId) => _uiWindows[windowId] = NextUiRefreshTick();
+
     public void RegisterUiWindow(string windowId)
     {
         if (string.IsNullOrWhiteSpace(windowId)) return;
@@ -627,11 +659,7 @@ internal sealed class EncodeBridgeRuntime : IDisposable
         // so a Host/action-driven redraw never gets followed by an immediate periodic redraw.
         lock (_uiRefreshGate)
         {
-            _uiWindows[windowId] = new UiWindowRefreshState
-            {
-                LogicalContentRoute = "/plugin/encodebridge",
-                NextRefreshTick = NextUiRefreshTick()
-            };
+            ScheduleUiRefreshLocked(windowId);
         }
         _uiRefreshScheduleChanged.Set();
     }
@@ -641,8 +669,8 @@ internal sealed class EncodeBridgeRuntime : IDisposable
         if (string.IsNullOrWhiteSpace(windowId)) return;
         lock (_uiRefreshGate)
         {
-            if (_uiWindows.TryGetValue(windowId, out var state))
-                state.NextRefreshTick = NextUiRefreshTick();
+            if (_uiWindows.ContainsKey(windowId))
+                ScheduleUiRefreshLocked(windowId);
         }
         _uiRefreshScheduleChanged.Set();
     }
@@ -674,11 +702,7 @@ internal sealed class EncodeBridgeRuntime : IDisposable
         {
             if (dto.State == TvAIrPlugin.Windows.PluginWindowLifecycleState.Shown)
             {
-                _uiWindows[dto.WindowInstanceId] = new UiWindowRefreshState
-                {
-                    LogicalContentRoute = "/plugin/encodebridge",
-                    NextRefreshTick = NextUiRefreshTick()
-                };
+                ScheduleUiRefreshLocked(dto.WindowInstanceId);
             }
             else if (dto.State is TvAIrPlugin.Windows.PluginWindowLifecycleState.Hidden or TvAIrPlugin.Windows.PluginWindowLifecycleState.Closing or TvAIrPlugin.Windows.PluginWindowLifecycleState.Closed)
                 _uiWindows.Remove(dto.WindowInstanceId);
@@ -706,7 +730,7 @@ internal sealed class EncodeBridgeRuntime : IDisposable
                     if (_uiWindows.Count > 0)
                     {
                         var nowTick = Environment.TickCount64;
-                        var nextTick = _uiWindows.Values.Min(x => x.NextRefreshTick);
+                        var nextTick = _uiWindows.Values.Min();
                         var remainingMs = nextTick - nowTick;
                         // Positive remaining time must never collapse to a zero-duration wait.
                         // This is the canonical guard against deadline-boundary busy loops.
@@ -741,13 +765,15 @@ internal sealed class EncodeBridgeRuntime : IDisposable
 #endif
             }
         }
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+#else
+        catch (Exception)
+#endif
         {
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
             endReason = "exception";
             WriteDeveloperDiagnostic($"ENCODEBRIDGE_UI_REFRESH_LOOP state=EXCEPTION threadId={threadId} generation={generation} cancellationRequested={_uiRefreshStop.IsSet} exception={ex.GetType().FullName} message={SanitizeDiagnosticValue(ex.Message)}");
-#else
-            _ = ex;
 #endif
         }
         finally
@@ -782,16 +808,16 @@ internal sealed class EncodeBridgeRuntime : IDisposable
         try
         {
             var nowTick = Environment.TickCount64;
-            KeyValuePair<string,UiWindowRefreshState>[] windows;
+            KeyValuePair<string,long>[] windows;
             lock (_uiRefreshGate)
             {
                 windows = _uiWindows
-                    .Where(x => x.Value.NextRefreshTick <= nowTick)
+                    .Where(x => x.Value <= nowTick)
                     .ToArray();
                 // Advance the authoritative deadline before any Host call. No elapsed deadline
                 // is replayed or caught up later, even after sleep/hidden/resume transitions.
                 foreach (var window in windows)
-                    window.Value.NextRefreshTick = nowTick + UiRefreshIdleDelayMs;
+                    _uiWindows[window.Key] = nowTick + UiRefreshIdleDelayMs;
             }
 
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
@@ -803,7 +829,7 @@ internal sealed class EncodeBridgeRuntime : IDisposable
             foreach (var window in windows)
             {
                 var id = window.Key;
-                var logicalContentRoute = window.Value.LogicalContentRoute;
+                var logicalContentRoute = UiContentRoute;
                 var contentRoute = logicalContentRoute + "?refreshRevision=" + tickSequence.ToString(System.Globalization.CultureInfo.InvariantCulture);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
                 var windowRefreshStarted = DateTimeOffset.UtcNow;
@@ -824,13 +850,15 @@ internal sealed class EncodeBridgeRuntime : IDisposable
                         _uiRefreshScheduleChanged.Set();
                     }
                 }
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
                 catch (Exception ex)
+#else
+                catch (Exception)
+#endif
                 {
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
                     var windowRefreshEnded = DateTimeOffset.UtcNow;
                     WriteDeveloperDiagnostic($"ENCODEBRIDGE_UI_REFRESH_WINDOW state=END window={id} logicalContentRoute={SanitizeDiagnosticValue(logicalContentRoute)} contentRoute={SanitizeDiagnosticValue(contentRoute)} result=FAILED elapsedMs={(windowRefreshEnded - windowRefreshStarted).TotalMilliseconds:0} cancellationRequested={_uiRefreshStop.IsSet} threadId={threadId} generation={generation} tickSequence={tickSequence} error={ex.GetType().Name}");
-#else
-                    _ = ex;
 #endif
                 }
             }
@@ -861,7 +889,9 @@ internal sealed class EncodeBridgeRuntime : IDisposable
         => string.IsNullOrWhiteSpace(value) ? "-" : value.Replace('\r', ' ').Replace('\n', ' ').Trim();
 #endif
 
-    public bool Stop(string id){lock(_gate)return _scheduler.Stop(id);} public bool Remove(string id){lock(_gate)return _scheduler.RemoveWaiting(id);} public bool Retry(string id){lock(_gate)return _scheduler.Retry(id);}
+    public EncodeQueueCommandResult Stop(string id) { lock (_gate) return _scheduler.Stop(id); }
+    public EncodeQueueCommandResult Remove(string id) { lock (_gate) return _scheduler.RemoveWaiting(id); }
+    public EncodeQueueCommandResult Retry(string id) { lock (_gate) return _scheduler.Retry(id); }
     public void Dispose()
     {
         lock (_gate) _disposing = true;
@@ -885,7 +915,7 @@ internal sealed class EncodeBridgeRuntime : IDisposable
             _uiRefreshScheduleChanged.Dispose();
         }
         try { _ctx.PluginSelections.Remove("encode-profile"); } catch { }
-        lock (_gate) _admissionLeaseIds.Clear();
+        lock (_gate) { _admissionLeaseIds.Clear(); _durableAdmissionDecisions.Clear(); _admissionDecisionOrder.Clear(); _newlyFinalizedPriorSessionPaths.Clear(); }
         _powerGuard.Dispose();
     }
 }

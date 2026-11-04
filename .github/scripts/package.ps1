@@ -32,7 +32,7 @@ $($spec.Name) v$($spec.Version) ($Platform) - ビルド済み配布
 
 Visual Studioによるビルドは不要です。必要なランタイムと利用条件はREADMEをご確認ください。
 $instructions
-更新時はTvAIrを終了して差し替え、既存の設定・保存データは保持してください。
+更新時はTvAIrを終了し、新しいファイルを今までのPluginsフォルダへ上書きしてください。設定ファイルはそのまま残ります。
 外部アプリやプラグインが必要な機能はREADMEの条件に従って設定してください。
 "@|Set-Content -LiteralPath (Join-Path $out 'INSTALL.txt') -Encoding utf8
 Compress-Archive -Path "$out/*" -DestinationPath "package/$($spec.Name)_v$($spec.Version)_$Platform.zip"

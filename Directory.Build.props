@@ -1,18 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project>
   <PropertyGroup>
-    <TvAIrProductVersion>1.2.14</TvAIrProductVersion>
-    <TvAIrFileVersion>1.2.14.0</TvAIrFileVersion>
-    <TvAIrAssemblyVersion>1.2.14.0</TvAIrAssemblyVersion>
-    <TvAIrPluginSdkVersion>1.1.18</TvAIrPluginSdkVersion>
+    <TvAIrProductVersion>1.2.15</TvAIrProductVersion>
+    <TvAIrFileVersion>1.2.15.0</TvAIrFileVersion>
+    <TvAIrAssemblyVersion>1.2.15.0</TvAIrAssemblyVersion>
+    <TvAIrPluginSdkVersion>1.1.19</TvAIrPluginSdkVersion>
     <TvAIrPluginSdkAssemblyVersion>1.0.0.0</TvAIrPluginSdkAssemblyVersion>
-    <TvAIrPluginHostContractVersion>1.1.18</TvAIrPluginHostContractVersion>
+    <TvAIrPluginHostContractVersion>1.1.19</TvAIrPluginHostContractVersion>
     <TvAIrPublicContractName>release_contract</TvAIrPublicContractName>
     <TvAIrPluginHostContractName>plugin-host-foundation</TvAIrPluginHostContractName>
     <TvAIrPluginCompatibilityMajor>1</TvAIrPluginCompatibilityMajor>
     <TvAIrMinimumSupportedPluginHostContractVersion>1.0.0</TvAIrMinimumSupportedPluginHostContractVersion>
-    <!-- Public source build defaults to Developer Diagnostics OFF. Normal operational logs remain enabled. -->
-    <TvAIrDeveloperDiagnostics Condition="'$(TvAIrDeveloperDiagnostics)' == ''">false</TvAIrDeveloperDiagnostics>
+    <!-- This archive kind selects the default of the same diagnostics compile boundary.
+         The development source defaults ON; the projected public source defaults OFF. -->
+    <TvAIrPublicRelease Condition="'$(TvAIrPublicRelease)' == ''">true</TvAIrPublicRelease>
+    <TvAIrDeveloperDiagnostics Condition="'$(TvAIrDeveloperDiagnostics)' == '' and '$(TvAIrPublicRelease)' == 'true'">false</TvAIrDeveloperDiagnostics>
+    <TvAIrDeveloperDiagnostics Condition="'$(TvAIrDeveloperDiagnostics)' == '' and '$(TvAIrPublicRelease)' != 'true'">true</TvAIrDeveloperDiagnostics>
     <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);TVAIR_DEVELOPER_DIAGNOSTICS</DefineConstants>
+    <TreatWarningsAsErrors Condition="'$(TvAIrPublicRelease)' == 'true'">true</TreatWarningsAsErrors>
   </PropertyGroup>
+  <!-- Keep public builds on the existing diagnostics compilation boundary. -->
+  <Target Name="EncodeBridgeValidateDiagnosticsGate" BeforeTargets="BeforeBuild">
+    <Error Condition="'$(TvAIrDeveloperDiagnostics)' != 'true' and '$(TvAIrDeveloperDiagnostics)' != 'false'"
+           Text="TvAIrDeveloperDiagnostics must be true or false." />
+    <Error Condition="'$(TvAIrPublicRelease)' == 'true' and '$(TvAIrDeveloperDiagnostics)' != 'false'"
+           Text="Public release builds require -p:TvAIrDeveloperDiagnostics=false." />
+  </Target>
 </Project>

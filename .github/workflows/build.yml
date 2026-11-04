@@ -23,7 +23,7 @@ jobs:
       - name: Rebuild public source with zero warnings
         shell: pwsh
         run: |
-          msbuild EncodeBridge.sln /restore /t:Rebuild /m /nr:false /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:PreferredToolArchitecture=x64 /p:LangVersion=12.0 /p:TvAIrDeveloperDiagnostics=false /p:AIrConDeveloperDiagnostics=false /p:AIrhythmDeveloperDiagnostics=false /warnaserror
+          msbuild EncodeBridge.sln /restore /t:Rebuild /m /nr:false /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:PreferredToolArchitecture=x64 /p:LangVersion=12.0 /p:TvAIrDeveloperDiagnostics=false /p:TvAIrPublicRelease=true /warnaserror
           if ($LASTEXITCODE -ne 0) { throw 'Build failed or produced warnings' }
       - name: Package public binaries
         shell: pwsh

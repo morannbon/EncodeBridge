@@ -1,6 +1,4 @@
-﻿using System.Text.Json;
-using System.Text.Json.Serialization;
-using TvAIrPlugin;
+﻿using TvAIrPlugin;
 
 namespace EncodeBridge.Domain;
 
@@ -9,16 +7,59 @@ internal static class EncodeBridgeDefaults
     public const int SchemaVersion = 2;
     public const bool AutoEncodeEnabled = false;
     public const int MaxConcurrentEncodes = 1;
+    public const int MinConcurrentEncodes = 1;
+    public const int MaxConcurrentEncodesLimit = 4;
     public const bool PauseStartWhileRecording = true;
     public const bool PauseStartWhileEpg = true;
     public const int MinimumFreeSpaceGb = 10;
+    public const int MinFreeSpaceGb = 1;
     public const int HistoryRetentionDays = 30;
+    public const int MinHistoryRetentionDays = 1;
+    public const int MaxHistoryRetentionDays = 36500;
+    public const EncodeToolKind DefaultToolKind = EncodeToolKind.Ffmpeg;
+    public const VideoCodecMode DefaultVideoCodec = VideoCodecMode.H265;
+    public const QualityPreset DefaultQuality = QualityPreset.Standard;
     public const string DefaultContainer = "mkv";
+    public const string DefaultSourceSubdirectory = "Encoded";
+    public const long MinRecordingBytes = 1024L * 1024L;
     public const int MaxPostEncodeBatchLength = 32768;
+    public const string UnverifiedResultMessage = "変換の結果を確認できません。変換後ファイルを確認してください。";
 }
 
 internal enum EncodeToolKind { Ffmpeg, NvEncC, QsvEncC, VceEncC, HandBrake, Amatsukaze, TmpgEnc, Custom }
-internal enum EncodeQueueState { Waiting, Running, HandedOff, Completed, Failed, Stopped }
+// Numeric enum values are part of the persisted queue/history format.
+internal enum EncodeQueueState { Waiting, Running, HandedOff, Completed, Failed, Stopped, Unverified }
+
+// The result of a user's queue command is separate from the eventual encoder result.
+// In particular, accepting a retry into the queue does not mean an encoder has started.
+internal enum EncodeQueueCommandState { Rejected, Started, Waiting, StopRequested, Removed, Completed, HandedOff }
+
+internal readonly record struct EncodeQueueCommandResult(EncodeQueueCommandState State, string Message)
+{
+    // A waiting retry was accepted into a durable queue. It is a successful
+    // command, not a claim that an encoder process has started.
+    public bool Succeeded => State is EncodeQueueCommandState.Started or EncodeQueueCommandState.Waiting
+        or EncodeQueueCommandState.StopRequested or EncodeQueueCommandState.Removed
+        or EncodeQueueCommandState.Completed or EncodeQueueCommandState.HandedOff;
+
+    public static EncodeQueueCommandResult Rejected(string message)
+        => new(EncodeQueueCommandState.Rejected, message);
+    public static EncodeQueueCommandResult Started()
+        => new(EncodeQueueCommandState.Started, "変換を開始しました。");
+    public static EncodeQueueCommandResult Waiting(string? reason)
+        => new(EncodeQueueCommandState.Waiting,
+            string.IsNullOrWhiteSpace(reason)
+                ? "変換待ちに登録しました。"
+                : $"変換待ちに登録しました。{reason}");
+    public static EncodeQueueCommandResult Completed()
+        => new(EncodeQueueCommandState.Completed, "変換が完了しました。");
+    public static EncodeQueueCommandResult HandedOff()
+        => new(EncodeQueueCommandState.HandedOff, "変換アプリへ引き渡しました。");
+    public static EncodeQueueCommandResult StopRequested()
+        => new(EncodeQueueCommandState.StopRequested, "停止を要求しました。");
+    public static EncodeQueueCommandResult Removed()
+        => new(EncodeQueueCommandState.Removed, "待機中の変換を削除しました。");
+}
 internal enum EncodeRuleKind { TitleContains, Channel, Genre, Default }
 internal enum OutputDirectoryMode { SameAsSource, Fixed, SourceSubdirectory }
 internal enum AudioTrackMode { All, MainOnly }
@@ -53,15 +94,15 @@ internal sealed class EncodeProfile
     public string Name { get; set; } = string.Empty;
     public string ToolId { get; set; } = string.Empty;
     public bool Enabled { get; set; } = true;
-    public VideoCodecMode VideoCodec { get; set; } = VideoCodecMode.H265;
-    public QualityPreset Quality { get; set; } = QualityPreset.Standard;
+    public VideoCodecMode VideoCodec { get; set; } = EncodeBridgeDefaults.DefaultVideoCodec;
+    public QualityPreset Quality { get; set; } = EncodeBridgeDefaults.DefaultQuality;
     public AudioTrackMode AudioTracks { get; set; } = AudioTrackMode.All;
     public AudioCodecMode AudioCodec { get; set; } = AudioCodecMode.PassthroughIfPossible;
     public SubtitleMode Subtitles { get; set; } = SubtitleMode.KeepIfPossible;
     public string Container { get; set; } = EncodeBridgeDefaults.DefaultContainer;
     public OutputDirectoryMode OutputDirectoryMode { get; set; } = OutputDirectoryMode.SameAsSource;
     public string OutputDirectory { get; set; } = string.Empty;
-    public string SourceSubdirectoryName { get; set; } = "Encoded";
+    public string SourceSubdirectoryName { get; set; } = EncodeBridgeDefaults.DefaultSourceSubdirectory;
     public Dictionary<string, string> AdapterSettings { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public List<string> AdditionalArguments { get; set; } = new();
     public string PostEncodeBatch { get; set; } = string.Empty;
@@ -114,7 +155,7 @@ internal sealed class EncodeProfileSnapshot
     public string Container { get; set; } = EncodeBridgeDefaults.DefaultContainer;
     public OutputDirectoryMode OutputDirectoryMode { get; set; }
     public string OutputDirectory { get; set; } = string.Empty;
-    public string SourceSubdirectoryName { get; set; } = "Encoded";
+    public string SourceSubdirectoryName { get; set; } = EncodeBridgeDefaults.DefaultSourceSubdirectory;
     public Dictionary<string, string> AdapterSettings { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public List<string> AdditionalArguments { get; set; } = new();
     public string PostEncodeBatch { get; set; } = string.Empty;
@@ -128,10 +169,6 @@ internal sealed class EncodeQueueItem
     public RecordingSnapshot Recording { get; set; } = new();
     public EncodeProfileSnapshot Profile { get; set; } = new();
     public EncodeQueueState State { get; set; } = EncodeQueueState.Waiting;
-    // Durable proof that the current automatic-admission policy was applied before queueing.
-    // Retain the existing JSON property name to preserve compatibility with persisted settings.
-    [JsonPropertyName("explicitReservationBindingVerified")]
-    public bool AdmissionPolicyVerified { get; set; }
     public int AttemptNumber { get; set; } = 1;
     public string ClientRequestId { get; set; } = string.Empty;
     public string ExternalJobId { get; set; } = string.Empty;
@@ -142,6 +179,9 @@ internal sealed class EncodeQueueItem
     public string LastError { get; set; } = string.Empty;
     public string? PreparedArtifactPath { get; set; }
     public bool HandoffOnly { get; set; }
+    // Persisted at the output-file commit boundary, before post-processing.
+    // Never infer completion merely from a same-named pre-existing MP4.
+    public bool OutputFinalized { get; set; }
     public bool PostEncodeBatchRunning { get; set; }
     public string PostEncodeBatchFilePath { get; set; } = string.Empty;
 }
@@ -176,7 +216,6 @@ internal sealed class EncodeBridgeStore
     public List<EncodeRule> Rules { get; set; } = new();
     public List<EncodeQueueItem> Queue { get; set; } = new();
     public List<EncodeHistoryItem> History { get; set; } = new();
-    public HashSet<string> ProcessedRecordingIds { get; set; } = new(StringComparer.Ordinal); // legacy; retained for saved-data compatibility
     public HashSet<string> ProcessedRecordingFileIds { get; set; } = new(StringComparer.Ordinal);
     public List<TvAirFinalizedRecordingFileDto> PendingFinalizedFiles { get; set; } = new();
     public string? FinalizedJournalId { get; set; }

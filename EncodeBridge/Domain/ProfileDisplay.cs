@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Linq;
 
 namespace EncodeBridge.Domain;
@@ -11,7 +11,7 @@ internal static class ProfileDisplay
     {
         string BaseName(EncodeProfile p)
         {
-            var tool = store.Tools.FirstOrDefault(t => string.Equals(t.ToolId, p.ToolId, StringComparison.OrdinalIgnoreCase));
+            var tool = EncodeProfilePolicy.ResolveTool(store, p.ToolId);
             return Name(tool?.Kind ?? EncodeToolKind.Ffmpeg, p.Quality, p.VideoCodec, p.Container);
         }
         var name = BaseName(profile);
@@ -21,9 +21,8 @@ internal static class ProfileDisplay
         return number > 0 ? $"{name} ({number})" : name;
     }
 
-    public static string Name(EncodeToolKind kind, QualityPreset quality, VideoCodecMode video, string container)
-    {
-        var tool = kind switch
+    // Used by both the profile labels and the registered-tool UI.
+    public static string ToolName(EncodeToolKind kind) => kind switch
         {
             EncodeToolKind.Ffmpeg => "FFmpeg",
             EncodeToolKind.NvEncC => "NVEncC",
@@ -35,6 +34,10 @@ internal static class ProfileDisplay
             EncodeToolKind.Custom => "その他CLI",
             _ => kind.ToString()
         };
+
+    public static string Name(EncodeToolKind kind, QualityPreset quality, VideoCodecMode video, string container)
+    {
+        var tool = ToolName(kind);
         var qualityName = quality switch
         {
             QualityPreset.High => "高画質",

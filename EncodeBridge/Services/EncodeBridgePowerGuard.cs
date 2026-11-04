@@ -3,8 +3,9 @@
 namespace EncodeBridge.Services;
 
 /// <summary>
-/// Holds one Host-owned power inhibition lease per nonterminal EncodeBridge queue item.
-/// Windows power requests and cleanup on plugin shutdown belong exclusively to TvAIr Host.
+/// Holds Host-owned power inhibition leases across accepted file admission and
+/// running external jobs. Deferred work releases its lease until dispatch.
+/// Windows power requests and shutdown cleanup belong exclusively to TvAIr Host.
 /// </summary>
 internal sealed class EncodeBridgePowerGuard : IDisposable
 {
@@ -81,42 +82,6 @@ internal sealed class EncodeBridgePowerGuard : IDisposable
             _leases.Remove(key);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
             _diagnostic?.Invoke($"ENCODEBRIDGE_POWER_GUARD state=ADMISSION_RELEASED reason={reason} owners={_leases.Count} boundary=journal_decision");
-#endif
-        }
-    }
-
-    public void Restore(IEnumerable<string> queueItemIds)
-    {
-        // Acquire all outstanding leases before scheduler resumes. On failure release those
-        // acquired during this restore and surface the failure instead of pretending protection.
-        var ids = queueItemIds.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.Ordinal).ToArray();
-        lock (_gate)
-        {
-            ThrowIfDisposed();
-            var added = new List<string>();
-            try
-            {
-                foreach (var id in ids)
-                {
-                    if (_leases.ContainsKey(id)) continue;
-                    var lease = _api.Acquire("EncodeWorkflow");
-                    _leases.Add(id, lease ?? throw new InvalidOperationException("Host returned a null power lease."));
-                    added.Add(id);
-                }
-            }
-            catch
-            {
-                foreach (var id in added)
-                {
-                    var lease = _leases[id];
-                    _leases.Remove(id);
-                    lease.Dispose();
-                }
-                throw;
-            }
-#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-            if (added.Count > 0)
-                _diagnostic?.Invoke($"ENCODEBRIDGE_POWER_GUARD state=RESTORED owners={_leases.Count} source=startup_queue owner=Host boundary=queue_accept_to_terminal");
 #endif
         }
     }

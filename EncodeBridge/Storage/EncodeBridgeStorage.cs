@@ -1,5 +1,6 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using TvAIrPlugin.Storage;
+using TvAIrPlugin.Runtime;
 using EncodeBridge.Domain;
 
 namespace EncodeBridge.Storage;
@@ -16,8 +17,16 @@ internal sealed class EncodeBridgeStorage
     public EncodeBridgeStore Load()
     {
         var result = _storage.Get(Namespace, StoreKey);
-        if (!result.Succeeded || result.Value is null)
-            return CreateDefault();
+        // Only a confirmed missing key represents first use. Storage failures must
+        // never reset configuration, history or the finalized-recording cursor.
+        if (!result.Succeeded)
+        {
+            if (result.Error?.Code == TvAirErrorCode.EntityNotFound)
+                return new EncodeBridgeStore();
+            throw new InvalidDataException("EncodeBridgeの保存データを読み込めませんでした。自動変換は開始しません。");
+        }
+        if (result.Value is null)
+            throw new InvalidDataException("EncodeBridgeの保存データを読み込めませんでした。自動変換は開始しません。");
         _revision = result.Value.Revision;
         try
         {
@@ -58,12 +67,6 @@ internal sealed class EncodeBridgeStorage
             return store;
         }
         throw new InvalidDataException($"未対応の保存形式です: {store.SchemaVersion}");
-    }
-
-    private static EncodeBridgeStore CreateDefault()
-    {
-        var store = new EncodeBridgeStore();
-        return store;
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)

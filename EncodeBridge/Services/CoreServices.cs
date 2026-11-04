@@ -1,4 +1,6 @@
-﻿using EncodeBridge.Adapters;
+﻿using System.Security.Cryptography;
+using System.Text;
+using EncodeBridge.Adapters;
 using EncodeBridge.Domain;
 using EncodeBridge.Storage;
 using EncodeBridge.Transport;
@@ -7,113 +9,141 @@ using TvAIrPlugin.Runtime;
 
 namespace EncodeBridge.Services;
 
-internal sealed class RuleResolver
-{
-    // Only an explicit Host Plugin Binding may override the selected default.
-    // Title/channel/genre rules are legacy data and must not silently re-route
-    // ordinary reservations (Program Guide, keyword, AI-rhythm, etc.).
-    public EncodeProfile? Resolve(EncodeBridgeStore store, RecordingSnapshot r)
-    {
-        var defaultRule = store.Rules
-            .Where(x => x.Enabled && x.Kind == EncodeRuleKind.Default)
-            .OrderBy(x => x.Order)
-            .FirstOrDefault();
-        return defaultRule is null ? null : store.Profiles.FirstOrDefault(x =>
-            x.Enabled && string.Equals(x.ProfileId, defaultRule.ProfileId, StringComparison.OrdinalIgnoreCase));
-    }
-
-}
-
 internal sealed class AdapterRegistry
 {
-    private readonly Dictionary<EncodeToolKind,IEncodeAdapter> _map;
-    public AdapterRegistry() => _map = new IEncodeAdapter[]{new FfmpegAdapter(),new NvEncAdapter(),new QsvEncAdapter(),new VceEncAdapter(),new HandBrakeAdapter(),new AmatsukazeAdapter(),new TmpgEncAdapter(),new CustomCliAdapter()}.ToDictionary(x=>x.Kind);
-    public IEncodeAdapter Get(EncodeToolKind kind)=>_map.TryGetValue(kind,out var a)?a:throw new InvalidOperationException("対応する変換ツールがありません。");
+    private readonly Dictionary<EncodeToolKind, IEncodeAdapter> _map;
+
+    public AdapterRegistry()
+    {
+        IEncodeAdapter[] adapters =
+        {
+            new FfmpegAdapter(), new NvEncAdapter(), new QsvEncAdapter(), new VceEncAdapter(),
+            new HandBrakeAdapter(), new AmatsukazeAdapter(), new TmpgEncAdapter(), new CustomCliAdapter()
+        };
+        _map = adapters.ToDictionary(adapter => adapter.Kind);
+    }
+
+    public IEncodeAdapter Get(EncodeToolKind kind) => _map.TryGetValue(kind, out var adapter)
+        ? adapter
+        : throw new InvalidOperationException("対応する変換ツールがありません。");
 }
 
 internal sealed class EncodeScheduler
 {
-    private readonly ITvAirPluginRuntimeContext _ctx; private readonly EncodeBridgeStorage _storage; private readonly EncodeBridgeStore _store; private readonly AdapterRegistry _adapters; private readonly EncodeBridgePowerGuard _powerGuard; private readonly TsServiceInspector _inspector=new();
+    private readonly ITvAirPluginRuntimeContext _ctx;
+    private readonly EncodeBridgeStorage _storage;
+    private readonly EncodeBridgeStore _store;
+    private readonly AdapterRegistry _adapters;
+    private readonly EncodeBridgePowerGuard _powerGuard;
+    private readonly TsServiceInspector _inspector = new();
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
     private readonly Action<string>? _diagnostic;
-    public EncodeScheduler(ITvAirPluginRuntimeContext ctx,EncodeBridgeStorage storage,EncodeBridgeStore store,AdapterRegistry adapters,EncodeBridgePowerGuard powerGuard,Action<string>? diagnostic=null){_ctx=ctx;_storage=storage;_store=store;_adapters=adapters;_powerGuard=powerGuard;_diagnostic=diagnostic;}
+
+    public EncodeScheduler(ITvAirPluginRuntimeContext ctx, EncodeBridgeStorage storage,
+        EncodeBridgeStore store, AdapterRegistry adapters, EncodeBridgePowerGuard powerGuard,
+        Action<string>? diagnostic = null)
+    {
+        _ctx = ctx;
+        _storage = storage;
+        _store = store;
+        _adapters = adapters;
+        _powerGuard = powerGuard;
+        _diagnostic = diagnostic;
+    }
 #else
-    public EncodeScheduler(ITvAirPluginRuntimeContext ctx,EncodeBridgeStorage storage,EncodeBridgeStore store,AdapterRegistry adapters,EncodeBridgePowerGuard powerGuard){_ctx=ctx;_storage=storage;_store=store;_adapters=adapters;_powerGuard=powerGuard;}
+    public EncodeScheduler(ITvAirPluginRuntimeContext ctx, EncodeBridgeStorage storage,
+        EncodeBridgeStore store, AdapterRegistry adapters, EncodeBridgePowerGuard powerGuard)
+    {
+        _ctx = ctx;
+        _storage = storage;
+        _store = store;
+        _adapters = adapters;
+        _powerGuard = powerGuard;
+    }
 #endif
 
     public void Evaluate()
     {
+        var historyBeforeReconcile = _store.History.Count;
         ReconcileJobs();
-        var maxConcurrent=Math.Clamp(_store.Settings.MaxConcurrentEncodes,1,4);
-        var waiting=_store.Queue.Where(x=>x.State==EncodeQueueState.Waiting).OrderBy(x=>x.AddedAt).ToArray();
-        if(waiting.Length>0 && _store.Queue.Count(x=>x.State==EncodeQueueState.Running)<maxConcurrent)
+        var maxConcurrent = Math.Clamp(_store.Settings.MaxConcurrentEncodes,
+            EncodeBridgeDefaults.MinConcurrentEncodes, EncodeBridgeDefaults.MaxConcurrentEncodesLimit);
+        var waiting = _store.Queue.Where(x => x.State == EncodeQueueState.Waiting)
+            .OrderBy(x => x.AddedAt).ToArray();
+        var runningCount = _store.Queue.Count(x => x.State == EncodeQueueState.Running);
+        if (waiting.Length > 0 && runningCount < maxConcurrent)
         {
-            if(_store.Settings.PauseStartWhileRecording&&_ctx.System.GetStatus().ActiveRecordingCount>0)
+            if (_store.Settings.PauseStartWhileRecording && _ctx.System.GetStatus().ActiveRecordingCount > 0)
             {
-                foreach(var item in waiting)item.WaitingReason="録画中のため開始を待っています。";
+                foreach (var item in waiting)
+                    item.WaitingReason = "録画中のため開始を待っています。";
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-                _diagnostic?.Invoke($"ENCODEBRIDGE_QUEUE_EVALUATE result=DEFERRED reason=recording waiting={waiting.Length} running={_store.Queue.Count(x=>x.State==EncodeQueueState.Running)}");
+                _diagnostic?.Invoke($"ENCODEBRIDGE_QUEUE_EVALUATE result=DEFERRED reason=recording waiting={waiting.Length} running={runningCount}");
 #endif
             }
-            else if(_store.Settings.PauseStartWhileEpg&&_ctx.Epg.GetStatus().IsRunning)
+            else if (_store.Settings.PauseStartWhileEpg && _ctx.Epg.GetStatus().IsRunning)
             {
-                foreach(var item in waiting)item.WaitingReason="番組情報を取得中のため開始を待っています。";
+                foreach (var item in waiting)
+                    item.WaitingReason = "番組情報を取得中のため開始を待っています。";
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-                _diagnostic?.Invoke($"ENCODEBRIDGE_QUEUE_EVALUATE result=DEFERRED reason=epg waiting={waiting.Length} running={_store.Queue.Count(x=>x.State==EncodeQueueState.Running)}");
+                _diagnostic?.Invoke($"ENCODEBRIDGE_QUEUE_EVALUATE result=DEFERRED reason=epg waiting={waiting.Length} running={runningCount}");
 #endif
             }
             else
             {
-                foreach(var item in waiting)
+                foreach (var item in waiting)
                 {
-                    if(_store.Queue.Count(x=>x.State==EncodeQueueState.Running)>=maxConcurrent)break;
-                    var consumed=TryStart(item);
+                    if (_store.Queue.Count(x => x.State == EncodeQueueState.Running) >= maxConcurrent)
+                        break;
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-                    if(!consumed)
+                    var consumed = TryStart(item);
+                    if (!consumed)
                         _diagnostic?.Invoke($"ENCODEBRIDGE_QUEUE_ITEM result=DEFERRED queueItemId={item.QueueItemId} recordingId={item.Recording.RecordingId} reason={item.WaitingReason}");
+#else
+                    TryStart(item);
 #endif
                 }
             }
         }
-        PurgeHistory(); _storage.Save(_store);
+        // Persist a live queue or a changed history; an unchanged idle poll does not
+        // rewrite the stored history.
+        var purged = PurgeHistory();
+        if (_store.Queue.Count != 0 || purged != 0 || _store.History.Count != historyBeforeReconcile)
+            _storage.Save(_store);
     }
 
-    public bool Retry(string id)
+    public EncodeQueueCommandResult Retry(string id)
     {
-        var h = _store.History.FirstOrDefault(x => x.QueueItemId == id && (x.Result == EncodeQueueState.Failed || x.Result == EncodeQueueState.Stopped));
-        if (h is null) return false;
+        var h = _store.History.FirstOrDefault(x => x.QueueItemId == id && (x.Result == EncodeQueueState.Failed || x.Result == EncodeQueueState.Stopped || x.Result == EncodeQueueState.Unverified));
+        if (h is null) return EncodeQueueCommandResult.Rejected("再実行できる履歴がありません。");
+        // A history row remains immutable. A retry is a new attempt with its own
+        // identity, so abandoning/removing the new waiting item cannot erase it.
+        if (_store.Queue.Any(x => RecordingFileIdentity.SameRecording(x.Recording, h.Recording)))
+            return EncodeQueueCommandResult.Rejected("この録画ファイルは変換待ちまたは変換中です。");
         var previousAttempt = h.AttemptNumber > 0 ? h.AttemptNumber : 1;
         var retryProfile = h.Profile;
 
-        // Retry with the current configuration. Prefer the original profile when it still
-        // exists; if it was deleted, fall back to the profile currently selected for
-        // post-recording automatic conversion (the Default rule). This prevents a retry
-        // from silently reusing an obsolete snapshot after the user rebuilt the profile.
-        var currentProfile = _store.Profiles.FirstOrDefault(x => x.Enabled && x.ProfileId == h.Profile.ProfileId);
+        // A retry uses the current enabled profile and executable where possible.
+        // If the original profile was deleted, use the current default; the existing
+        // history snapshot remains intact.
+        var currentProfile = EncodeProfilePolicy.ResolveEnabledById(_store, h.Profile.ProfileId);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
         var profileSource = "original-current";
 #endif
         if (currentProfile is null)
         {
-            var defaultRule = _store.Rules
-                .Where(x => x.Enabled && x.Kind == EncodeRuleKind.Default)
-                .OrderBy(x => x.Order)
-                .FirstOrDefault();
-            if (defaultRule is not null)
-            {
-                currentProfile = _store.Profiles.FirstOrDefault(x => x.Enabled && x.ProfileId == defaultRule.ProfileId);
+            currentProfile = EncodeProfilePolicy.ResolveDefault(_store);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-                profileSource = "current-default";
+            if (currentProfile is not null) profileSource = "current-default";
 #endif
-            }
         }
 
         if (currentProfile is not null)
         {
-            var currentTool = _store.Tools.FirstOrDefault(x => x.ToolId == currentProfile.ToolId);
+            var currentTool = EncodeProfilePolicy.ResolveTool(_store, currentProfile.ToolId);
             if (currentTool is not null)
             {
-                retryProfile = SnapshotProfile(currentProfile, currentTool);
+                retryProfile = EncodeProfileSnapshotFactory.Create(_store, currentProfile, currentTool);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
                 _diagnostic?.Invoke($"ENCODEBRIDGE_RETRY_PROFILE result=RESNAPSHOT queueItemId={h.QueueItemId} recordingId={h.RecordingId} source={profileSource} profileId={currentProfile.ProfileId} tool={currentTool.Kind}");
 #endif
@@ -122,11 +152,10 @@ internal sealed class EncodeScheduler
 
         var q = new EncodeQueueItem
         {
-            QueueItemId = h.QueueItemId,
+            QueueItemId = Guid.NewGuid().ToString("N"),
             Recording = h.Recording,
             Profile = retryProfile,
             AttemptNumber = checked(previousAttempt + 1),
-            AdmissionPolicyVerified = true, // user explicitly initiated retry
             State = EncodeQueueState.Waiting,
             AddedAt = DateTimeOffset.Now
         };
@@ -135,122 +164,270 @@ internal sealed class EncodeScheduler
 #else
         _powerGuard.Acquire(q.QueueItemId);
 #endif
-        _store.History.Remove(h);
         _store.Queue.Add(q);
+        try { _storage.Save(_store); }
+        catch
+        {
+            _store.Queue.Remove(q);
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+            _powerGuard.Release(q.QueueItemId, "retry_save_failed");
+#else
+            _powerGuard.Release(q.QueueItemId);
+#endif
+            throw;
+        }
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
         _diagnostic?.Invoke($"ENCODEBRIDGE_QUEUE_ACCEPTED queueItemId={q.QueueItemId} recordingId={q.Recording.RecordingId} powerHeld={_powerGuard.IsHeld(q.QueueItemId)} boundary=retry_queue_accept");
 #endif
-        _storage.Save(_store);
         Evaluate();
-        return true;
-    }
-
-    private EncodeProfileSnapshot SnapshotProfile(EncodeProfile profile, EncodeTool tool)
-    {
-        var snapshot = new EncodeProfileSnapshot
+        // Read the authoritative post-evaluation state, not merely the acceptance
+        // of the retry request. It may already have failed, started or remained waiting.
+        var queued = _store.Queue.FirstOrDefault(x => x.QueueItemId == q.QueueItemId);
+        if (queued is not null)
         {
-            ProfileId = profile.ProfileId,
-            ProfileName = ProfileDisplay.Label(_store, profile),
-            ToolId = tool.ToolId,
-            ToolKind = tool.Kind,
-            ToolName = tool.DisplayName,
-            ExecutablePath = tool.ExecutablePath,
-            VideoCodec = profile.VideoCodec,
-            Quality = profile.Quality,
-            AudioTracks = profile.AudioTracks,
-            AudioCodec = profile.AudioCodec,
-            Subtitles = profile.Subtitles,
-            Container = profile.Container,
-            OutputDirectoryMode = profile.OutputDirectoryMode,
-            OutputDirectory = profile.OutputDirectory,
-            SourceSubdirectoryName = profile.SourceSubdirectoryName,
-            AdapterSettings = new(profile.AdapterSettings, StringComparer.OrdinalIgnoreCase),
-            AdditionalArguments = new(profile.AdditionalArguments),
-            PostEncodeBatch = profile.PostEncodeBatch,
-            PostEncodeBatchEnabled = profile.PostEncodeBatchEnabled && profile.PostEncodeBatchRiskAccepted,
-            PostEncodeBatchRiskAccepted = profile.PostEncodeBatchRiskAccepted
-        };
-        foreach (var kv in tool.Settings)
-            snapshot.AdapterSettings.TryAdd(kv.Key, kv.Value);
-        return snapshot;
+            if (queued.State == EncodeQueueState.Running)
+                return EncodeQueueCommandResult.Started();
+            if (queued.State == EncodeQueueState.Waiting)
+                return EncodeQueueCommandResult.Waiting(queued.WaitingReason);
+        }
+        var terminal = _store.History.FirstOrDefault(x => x.QueueItemId == q.QueueItemId
+            && x.AttemptNumber == q.AttemptNumber);
+        if (terminal is not null)
+        {
+            // Very short external jobs may reach a terminal state inside Evaluate.
+            // Report the actual outcome rather than treating every terminal as an error.
+            if (terminal.Result == EncodeQueueState.Completed)
+                return EncodeQueueCommandResult.Completed();
+            if (terminal.Result == EncodeQueueState.HandedOff)
+                return EncodeQueueCommandResult.HandedOff();
+            return EncodeQueueCommandResult.Rejected(string.IsNullOrWhiteSpace(terminal.FailureMessage)
+                ? "変換を完了できませんでした。履歴を確認してください。"
+                : $"変換を完了できませんでした。{terminal.FailureMessage}");
+        }
+        return EncodeQueueCommandResult.Rejected("再実行の状態を確認できませんでした。");
     }
 
-    public bool Stop(string id){var q=_store.Queue.FirstOrDefault(x=>x.QueueItemId==id&&x.State==EncodeQueueState.Running); if(q is null||string.IsNullOrWhiteSpace(q.ExternalJobId))return false; return _ctx.ExternalJobs.Cancel(q.ExternalJobId);}
-    public bool RemoveWaiting(string id){var q=_store.Queue.FirstOrDefault(x=>x.QueueItemId==id&&x.State==EncodeQueueState.Waiting); if(q is null)return false; _store.Queue.Remove(q);
+    public EncodeQueueCommandResult Stop(string id)
+    {
+        var item = _store.Queue.FirstOrDefault(x => x.QueueItemId == id && x.State == EncodeQueueState.Running);
+        if (item is null || string.IsNullOrWhiteSpace(item.ExternalJobId))
+            return EncodeQueueCommandResult.Rejected("停止できる変換がありません。");
+        return _ctx.ExternalJobs.Cancel(item.ExternalJobId)
+            ? EncodeQueueCommandResult.StopRequested()
+            : EncodeQueueCommandResult.Rejected("停止を要求できませんでした。");
+    }
+
+    public EncodeQueueCommandResult RemoveWaiting(string id)
+    {
+        var item = _store.Queue.FirstOrDefault(x => x.QueueItemId == id && x.State == EncodeQueueState.Waiting);
+        if (item is null)
+            return EncodeQueueCommandResult.Rejected("削除できる待機中の変換がありません。");
+        _store.Queue.Remove(item);
+        try { _storage.Save(_store); }
+        catch
+        {
+            _store.Queue.Add(item);
+            throw;
+        }
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-        _powerGuard.Release(q.QueueItemId,"waiting_removed");
+        _powerGuard.Release(item.QueueItemId, "waiting_removed");
 #else
-        _powerGuard.Release(q.QueueItemId);
+        _powerGuard.Release(item.QueueItemId);
 #endif
-        _storage.Save(_store);return true;}
+        return EncodeQueueCommandResult.Removed();
+    }
+
+    // A waiting item owns no running encoder. Release its power lease until the
+    // next successful dispatch; keep its durable queue entry and original output path.
+    private bool DeferWaiting(EncodeQueueItem item, string reason)
+    {
+        item.WaitingReason = reason;
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+        _powerGuard.Release(item.QueueItemId, "waiting_before_dispatch");
+#else
+        _powerGuard.Release(item.QueueItemId);
+#endif
+        return false;
+    }
+
+    private static bool HasSufficientOutputSpace(string directory, int minimumFreeSpaceGb)
+    {
+        try
+        {
+            var root = Path.GetPathRoot(Path.GetFullPath(directory));
+            return !string.IsNullOrWhiteSpace(root) &&
+                new DriveInfo(root).AvailableFreeSpace >= (long)minimumFreeSpaceGb * 1024 * 1024 * 1024;
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+        catch (ArgumentException) { return false; }
+    }
+
+    // The normal output and adapter-provided output obey the same storage policy.
+    // Never silently redirect to another disk or overwrite an existing file.
+    private string? ValidateOutputStorage(string outputPath)
+    {
+        var directory = Path.GetDirectoryName(outputPath);
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+            return "保存先を使用できません。";
+        if (File.Exists(outputPath))
+            return "出力ファイルが既に存在します。";
+        if (!HasSufficientOutputSpace(directory, _store.Settings.MinimumFreeSpaceGb))
+            return "保存先の空き容量を確認してください。";
+        return null;
+    }
 
     private bool TryStart(EncodeQueueItem item)
     {
-        item.WaitingReason=string.Empty;
-        if(!File.Exists(item.Recording.SourceFilePath)){Fail(item,"録画ファイルが見つかりません。",null);return true;}
-        item.ExpectedOutputPath=BuildOutputPath(item);
-        var outDir=Path.GetDirectoryName(item.ExpectedOutputPath)!; if(!Directory.Exists(outDir)){item.WaitingReason="保存先を使用できません。";return false;}
-        if(File.Exists(item.ExpectedOutputPath)){item.WaitingReason="出力ファイルが既に存在します。";return false;}
-        try{var drive=new DriveInfo(Path.GetPathRoot(outDir)!); if(drive.AvailableFreeSpace < (long)_store.Settings.MinimumFreeSpaceGb*1024*1024*1024){item.WaitingReason="保存先の空き容量を確認してください。";return false;}}catch{item.WaitingReason="保存先を使用できません。";return false;}
+        var dispatchAttempted = false;
+        item.WaitingReason = string.Empty;
+        if (!File.Exists(item.Recording.SourceFilePath))
+        {
+            Fail(item, "録画ファイルが見つかりません。", null);
+            return true;
+        }
+
+        item.ExpectedOutputPath = ResolveOutputPath(item);
+        var storageError = ValidateOutputStorage(item.ExpectedOutputPath);
+        if (storageError is not null) return DeferWaiting(item, storageError);
+
         try
         {
-            var service=_inspector.Inspect(item.Recording.SourceFilePath,item.Recording.ServiceId); var adapter=_adapters.Get(item.Profile.ToolKind); var chk=adapter.ValidateTool(item.Profile); if(!chk.Succeeded){item.WaitingReason=chk.Message;return false;} chk=adapter.Preflight(item,service); if(!chk.Succeeded){item.WaitingReason=chk.Message;return false;}
-            item.ClientRequestId=$"encodebridge:{item.QueueItemId}:{item.AttemptNumber}"; _storage.Save(_store);
-            var plan=adapter.BuildProcess(item,service); item.ExpectedOutputPath=plan.ExpectedOutputPath;
-            if (!plan.HandoffOnly && !string.IsNullOrWhiteSpace(plan.PreparedArtifactPath) && File.Exists(plan.PreparedArtifactPath)) File.Delete(plan.PreparedArtifactPath);
+            var service = _inspector.Inspect(item.Recording.SourceFilePath, item.Recording.ServiceId);
+            var adapter = _adapters.Get(item.Profile.ToolKind);
+            var check = adapter.ValidateTool(item.Profile);
+            if (!check.Succeeded) return DeferWaiting(item, check.Message);
+            check = adapter.Preflight(item, service);
+            if (!check.Succeeded) return DeferWaiting(item, check.Message);
+
+            var plan = adapter.BuildProcess(item, service);
+            storageError = ValidateOutputStorage(plan.ExpectedOutputPath);
+            if (storageError is not null) return DeferWaiting(item, storageError);
+
+            // A lease must be held before the durable external dispatch boundary.
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+            _powerGuard.Acquire(item.QueueItemId, "output_ready");
+#else
+            _powerGuard.Acquire(item.QueueItemId);
+#endif
+            item.ClientRequestId = $"encodebridge:{item.QueueItemId}:{item.AttemptNumber}";
+            item.ExpectedOutputPath = plan.ExpectedOutputPath;
+            _storage.Save(_store);
+            if (!plan.HandoffOnly && !string.IsNullOrWhiteSpace(plan.PreparedArtifactPath) && File.Exists(plan.PreparedArtifactPath))
+                File.Delete(plan.PreparedArtifactPath);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
             _diagnostic?.Invoke($"ENCODEBRIDGE_EXTERNAL_COMMAND recordingId={item.Recording.RecordingId} tool={item.Profile.ToolKind} exe={DiagnosticQuote(plan.ExecutablePath)} cwd={DiagnosticQuote(plan.WorkingDirectory ?? string.Empty)} args={DiagnosticCommandLine(plan.Arguments)} output={DiagnosticQuote(plan.ExpectedOutputPath)} staging={DiagnosticQuote(plan.PreparedArtifactPath ?? string.Empty)}");
 #endif
-            var job=_ctx.ExternalJobs.Enqueue(new TvAirExternalJobRequestDto{Kind=TvAirExternalJobKind.EncodeRecording,ReservationId=item.Recording.ReservationId,RecordingId=string.IsNullOrWhiteSpace(item.Recording.RecordingFileId) ? item.Recording.RecordingId : null,ClientRequestId=item.ClientRequestId,Process=new TvAirExternalProcessSpecDto{ExecutablePath=plan.ExecutablePath,Arguments=plan.Arguments,WorkingDirectory=plan.WorkingDirectory}});
-            if(!job.Accepted){Fail(item,job.Message??"変換ツールを開始できませんでした。",job.ExitCode);return true;}
-            item.ExternalJobId=job.JobId; item.State=EncodeQueueState.Running; item.StartedAt=job.StartedAt??DateTimeOffset.Now; item.HandoffOnly=plan.HandoffOnly; item.PreparedArtifactPath=plan.PreparedArtifactPath; _storage.Save(_store);
+            dispatchAttempted = true;
+            var job = _ctx.ExternalJobs.Enqueue(CreateExternalJobRequest(item, item.ClientRequestId,
+                new TvAirExternalProcessSpecDto
+                {
+                    ExecutablePath = plan.ExecutablePath,
+                    Arguments = plan.Arguments,
+                    WorkingDirectory = plan.WorkingDirectory
+                }));
+            if (!job.Accepted)
+            {
+                Fail(item, job.Message ?? "変換ツールを開始できませんでした。", job.ExitCode);
+                return true;
+            }
+
+            item.ExternalJobId = job.JobId;
+            item.State = EncodeQueueState.Running;
+            item.StartedAt = job.StartedAt ?? DateTimeOffset.Now;
+            item.HandoffOnly = plan.HandoffOnly;
+            item.PreparedArtifactPath = plan.PreparedArtifactPath;
+            _storage.Save(_store);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
             _diagnostic?.Invoke($"ENCODEBRIDGE_EXTERNAL_JOB result=STARTED queueItemId={item.QueueItemId} recordingId={item.Recording.RecordingId} jobId={item.ExternalJobId} tool={item.Profile.ToolKind}");
 #endif
             return true;
         }
-        catch(Exception ex)
+        catch (Exception ex)
         {
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-            _diagnostic?.Invoke($"ENCODEBRIDGE_QUEUE_ITEM result=FAILED queueItemId={item.QueueItemId} recordingId={item.Recording.RecordingId} error={ex.GetType().Name}:{ex.Message}");
+            _diagnostic?.Invoke($"ENCODEBRIDGE_QUEUE_ITEM result={(dispatchAttempted ? "DISPATCH_UNVERIFIED" : "FAILED")} queueItemId={item.QueueItemId} recordingId={item.Recording.RecordingId} error={ex.GetType().Name}:{ex.Message}");
 #endif
-            Fail(item,ex.Message,null);
+            if (dispatchAttempted)
+            {
+                // Once dispatch was attempted, an exception cannot prove that
+                // the Host did not start the encoder. Never dispatch it again.
+                item.State = EncodeQueueState.Running;
+                throw new InvalidOperationException("変換開始の結果を確認できません。自動では再実行しません。", ex);
+            }
+            Fail(item, ex.Message, null);
             return true;
         }
     }
 
+    // Encoding and post-processing are separate external jobs with the same
+    // recording attribution and cancellation semantics.
+    private static TvAirExternalJobRequestDto CreateExternalJobRequest(EncodeQueueItem item,
+        string requestId, TvAirExternalProcessSpecDto process) => new()
+    {
+        Kind = TvAirExternalJobKind.EncodeRecording,
+        ReservationId = item.Recording.ReservationId,
+        RecordingId = string.IsNullOrWhiteSpace(item.Recording.RecordingFileId)
+            ? item.Recording.RecordingId : null,
+        ClientRequestId = requestId,
+        Process = process
+    };
+
     private void ReconcileJobs()
     {
-        foreach(var item in _store.Queue.Where(x=>x.State==EncodeQueueState.Running).ToArray())
+        foreach (var item in _store.Queue.Where(x => x.State == EncodeQueueState.Running).ToArray())
         {
-            if(string.IsNullOrWhiteSpace(item.ExternalJobId)){Finish(item,EncodeQueueState.Stopped,null,"前回の変換は完了していません。");continue;}
-            var job=_ctx.ExternalJobs.Get(item.ExternalJobId); if(job is null){Finish(item,EncodeQueueState.Stopped,null,"前回の変換は完了していません。");continue;}
-            if(job.StateCode is TvAirExternalJobState.Queued or TvAirExternalJobState.Running) continue;
-            var handoff=item.HandoffOnly;
-            if(job.StateCode==TvAirExternalJobState.Succeeded)
+            if (string.IsNullOrWhiteSpace(item.ExternalJobId))
             {
-                if(item.PostEncodeBatchRunning)
-                {
-                    CleanupPostEncodeBatch(item);
-                    Finish(item,EncodeQueueState.Completed,job.ExitCode,string.Empty);
-                }
-                else if(handoff)
-                {
-                    Finish(item,EncodeQueueState.HandedOff,job.ExitCode,string.Empty);
-                }
-                else if(TryFinalizePreparedOutput(item, out var finalizeError))
-                {
-                    if(!item.Profile.PostEncodeBatchEnabled || string.IsNullOrWhiteSpace(item.Profile.PostEncodeBatch))
-                        Finish(item,EncodeQueueState.Completed,job.ExitCode,string.Empty);
-                    else if(!TryStartPostEncodeBatch(item, out var postBatchError))
-                        Finish(item,EncodeQueueState.Failed,null,postBatchError);
-                }
-                else Finish(item,EncodeQueueState.Failed,job.ExitCode,finalizeError);
+                Finish(item, EncodeQueueState.Unverified, null, EncodeBridgeDefaults.UnverifiedResultMessage);
+                continue;
             }
-            else if(job.StateCode==TvAirExternalJobState.Cancelled)
+            TvAirExternalJobDto? job;
+            try { job = _ctx.ExternalJobs.Get(item.ExternalJobId); }
+            catch (Exception)
             {
-                CleanupPostEncodeBatch(item);
-                Finish(item,EncodeQueueState.Stopped,job.ExitCode,string.Empty);
+                // An unavailable status query is not a terminal job result.
+                // Keep the queue item and power lease until status can be reconciled.
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+                _diagnostic?.Invoke($"ENCODEBRIDGE_EXTERNAL_STATUS result=DEFERRED queueItemId={item.QueueItemId} reason=status_unavailable");
+#endif
+                continue;
+            }
+            if (job is null)
+            {
+                Finish(item, EncodeQueueState.Unverified, null, EncodeBridgeDefaults.UnverifiedResultMessage);
+                continue;
+            }
+            if (job.StateCode is TvAirExternalJobState.Queued or TvAirExternalJobState.Running)
+                continue;
+
+            if (job.StateCode == TvAirExternalJobState.Succeeded)
+            {
+                if (item.PostEncodeBatchRunning)
+                {
+                    Finish(item, EncodeQueueState.Completed, job.ExitCode, string.Empty);
+                }
+                else if (item.HandoffOnly)
+                {
+                    Finish(item, EncodeQueueState.HandedOff, job.ExitCode, string.Empty);
+                }
+                else if (TryFinalizePreparedOutput(item, out var finalizeError))
+                {
+                    item.OutputFinalized = true;
+                    _storage.Save(_store);
+                    if (!item.Profile.PostEncodeBatchEnabled || string.IsNullOrWhiteSpace(item.Profile.PostEncodeBatch))
+                        Finish(item, EncodeQueueState.Completed, job.ExitCode, string.Empty);
+                    else if (!TryStartPostEncodeBatch(item, out var postBatchError))
+                        Finish(item, EncodeQueueState.Failed, null, postBatchError);
+                }
+                else
+                {
+                    Finish(item, EncodeQueueState.Failed, job.ExitCode, finalizeError);
+                }
+            }
+            else if (job.StateCode == TvAirExternalJobState.Cancelled)
+            {
+                Finish(item, EncodeQueueState.Stopped, job.ExitCode, string.Empty);
             }
             else
             {
@@ -259,9 +436,8 @@ internal sealed class EncodeScheduler
 #endif
                 var failure = item.PostEncodeBatchRunning
                     ? (job.Message ?? job.StandardErrorTail ?? "変換後バッチを完了できませんでした。")
-                    : BuildJobFailureMessage(item,job);
-                CleanupPostEncodeBatch(item);
-                Finish(item,EncodeQueueState.Failed,job.ExitCode,failure);
+                    : BuildJobFailureMessage(item, job);
+                Finish(item, EncodeQueueState.Failed, job.ExitCode, failure);
             }
         }
     }
@@ -269,6 +445,8 @@ internal sealed class EncodeScheduler
     private bool TryStartPostEncodeBatch(EncodeQueueItem item, out string error)
     {
         error = string.Empty;
+        string? createdBatchPath = null;
+        var dispatchAttempted = false;
         try
         {
             var batchBody = item.Profile.PostEncodeBatch ?? string.Empty;
@@ -281,6 +459,7 @@ internal sealed class EncodeScheduler
             var tempDir = Path.Combine(Path.GetTempPath(), "EncodeBridge", "post-encode");
             Directory.CreateDirectory(tempDir);
             var batchPath = Path.Combine(tempDir, $"{item.QueueItemId}-{item.AttemptNumber}.cmd");
+            createdBatchPath = batchPath;
             var expanded = ExpandPostEncodeBatch(batchBody, item);
             var script = "@echo off\r\nsetlocal DisableDelayedExpansion\r\n" + expanded + "\r\nexit /b %errorlevel%\r\n";
             System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
@@ -301,19 +480,14 @@ internal sealed class EncodeScheduler
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
             _diagnostic?.Invoke($"ENCODEBRIDGE_POST_BATCH result=STARTING queueItemId={item.QueueItemId} recordingId={item.Recording.RecordingId} scriptLength={batchBody.Length} source={DiagnosticQuote(item.Recording.SourceFilePath)} output={DiagnosticQuote(item.ExpectedOutputPath)}");
 #endif
-            var job = _ctx.ExternalJobs.Enqueue(new TvAirExternalJobRequestDto
-            {
-                Kind = TvAirExternalJobKind.EncodeRecording,
-                ReservationId = item.Recording.ReservationId,
-                RecordingId = string.IsNullOrWhiteSpace(item.Recording.RecordingFileId) ? item.Recording.RecordingId : null,
-                ClientRequestId = requestId,
-                Process = new TvAirExternalProcessSpecDto
+            dispatchAttempted = true;
+            var job = _ctx.ExternalJobs.Enqueue(CreateExternalJobRequest(item, requestId,
+                new TvAirExternalProcessSpecDto
                 {
                     ExecutablePath = comspec,
                     Arguments = new[] { "/d", "/s", "/c", batchPath },
                     WorkingDirectory = Path.GetDirectoryName(item.Recording.SourceFilePath)
-                }
-            });
+                }));
             if (!job.Accepted)
             {
                 TryDelete(batchPath);
@@ -331,12 +505,22 @@ internal sealed class EncodeScheduler
 #endif
             return true;
         }
-        #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
-        #else
+#else
         catch (Exception)
-        #endif
+#endif
         {
+            if (dispatchAttempted)
+            {
+                // A dispatch exception cannot prove the Host rejected the job.
+                // Preserve the script and power lease rather than claiming failure.
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+                _diagnostic?.Invoke($"ENCODEBRIDGE_POST_BATCH result=DISPATCH_UNVERIFIED queueItemId={item.QueueItemId} recordingId={item.Recording.RecordingId}");
+#endif
+                throw;
+            }
+            TryDelete(createdBatchPath);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
             _diagnostic?.Invoke($"ENCODEBRIDGE_POST_BATCH result=FAILED_TO_START queueItemId={item.QueueItemId} recordingId={item.Recording.RecordingId} error={DiagnosticQuote(ex.GetType().Name + ":" + ex.Message)}");
 #endif
@@ -408,11 +592,11 @@ internal sealed class EncodeScheduler
 #endif
             return true;
         }
-        #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
-        #else
+#else
         catch (Exception)
-        #endif
+#endif
         {
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
             _diagnostic?.Invoke($"ENCODEBRIDGE_OUTPUT_FINALIZE result=FAILED recordingId={item.Recording.RecordingId} tool={item.Profile.ToolKind} staging={DiagnosticQuote(prepared)} output={DiagnosticQuote(item.ExpectedOutputPath)} error={DiagnosticQuote(ex.GetType().Name + ":" + ex.Message)}");
@@ -477,11 +661,11 @@ internal sealed class EncodeScheduler
 #endif
             return $"{baseMessage} / TMPGEnc Project Creator: {tail}";
         }
-        #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
-        #else
+#else
         catch (Exception)
-        #endif
+#endif
         {
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
             _diagnostic?.Invoke($"ENCODEBRIDGE_TMPGENC_PROJECTCREATOR result=FAILED recordingId={item.Recording.RecordingId} exitCode={job.ExitCode?.ToString() ?? "-"} logState=read_error error={ex.GetType().Name}:{ex.Message}");
@@ -490,14 +674,161 @@ internal sealed class EncodeScheduler
         }
     }
 
-    private string BuildOutputPath(EncodeQueueItem item){var src=item.Recording.SourceFilePath;var dir=item.Profile.OutputDirectoryMode switch{OutputDirectoryMode.Fixed=>item.Profile.OutputDirectory,OutputDirectoryMode.SourceSubdirectory=>Path.Combine(Path.GetDirectoryName(src)!,item.Profile.SourceSubdirectoryName),_=>Path.GetDirectoryName(src)!};var ext="."+item.Profile.Container.TrimStart('.');return Path.Combine(dir,Path.GetFileNameWithoutExtension(src)+ext);}
-    private void Fail(EncodeQueueItem item,string msg,int? exit)=>Finish(item,EncodeQueueState.Failed,exit,msg);
-    private void Finish(EncodeQueueItem item,EncodeQueueState state,int? exit,string msg){CleanupPostEncodeBatch(item);item.State=state;item.LastError=msg;_store.Queue.Remove(item);_store.History.Add(new EncodeHistoryItem{QueueItemId=item.QueueItemId,RecordingId=item.Recording.RecordingId,Title=item.Recording.Title,ServiceName=item.Recording.ServiceName,ActualStart=item.Recording.ActualStart,SourceFilePath=item.Recording.SourceFilePath,OutputFilePath=item.ExpectedOutputPath,ProfileName=item.Profile.ProfileName,ToolName=item.Profile.ToolName,Result=state,StartedAt=item.StartedAt,FinishedAt=DateTimeOffset.Now,ExitCode=exit,FailureMessage=msg,AttemptNumber=item.AttemptNumber,Recording=item.Recording,Profile=item.Profile});
+    // The file path supplied by the Host remains authoritative. The selected output
+    // directory is never silently redirected to another drive when a volume is full.
+    private static string BuildOutputPath(EncodeQueueItem item)
+    {
+        var source = item.Recording.SourceFilePath;
+        var sourceDirectory = Path.GetDirectoryName(source)!;
+        var directory = item.Profile.OutputDirectoryMode switch
+        {
+            OutputDirectoryMode.Fixed => item.Profile.OutputDirectory,
+            OutputDirectoryMode.SourceSubdirectory => Path.Combine(sourceDirectory, item.Profile.SourceSubdirectoryName),
+            _ => sourceDirectory
+        };
+        return Path.Combine(directory, Path.GetFileNameWithoutExtension(source) + "." + item.Profile.Container.TrimStart('.'));
+    }
+
+    // Relay segments can have identical names on different source volumes while a
+    // fixed output directory is shared. Reserve the destination across active and
+    // completed jobs; never overwrite the output of another physical source file.
+    private string ResolveOutputPath(EncodeQueueItem item)
+    {
+        if (!string.IsNullOrWhiteSpace(item.ExpectedOutputPath))
+            return item.ExpectedOutputPath;
+
+        var normal = BuildOutputPath(item);
+        if (!OutputClaimedByAnotherSource(normal, item)) return normal;
+
+        // Stable across restarts and independent of queue order. Hash the physical
+        // source path, not the reservation ID (which is shared by relay segments).
+        var canonicalSource = Path.GetFullPath(item.Recording.SourceFilePath).ToUpperInvariant();
+        var digest = SHA256.HashData(Encoding.UTF8.GetBytes(canonicalSource));
+        var suffix = Convert.ToHexString(digest.AsSpan(0, 8)).ToLowerInvariant();
+        var directory = Path.GetDirectoryName(normal)!;
+        var filename = Path.GetFileNameWithoutExtension(normal);
+        var extension = Path.GetExtension(normal);
+        var alternate = Path.Combine(directory, filename + "_" + suffix + extension);
+        return alternate;
+    }
+
+    private bool OutputClaimedByAnotherSource(string output, EncodeQueueItem item)
+    {
+        return _store.Queue.Any(x => !ReferenceEquals(x, item)
+            && string.Equals(string.IsNullOrWhiteSpace(x.ExpectedOutputPath) ? BuildOutputPath(x) : x.ExpectedOutputPath, output, StringComparison.OrdinalIgnoreCase)
+            && !RecordingFileIdentity.SameSourcePath(x.Recording.SourceFilePath, item.Recording.SourceFilePath))
+            || _store.History.Any(x => string.Equals(x.OutputFilePath, output, StringComparison.OrdinalIgnoreCase)
+            && !RecordingFileIdentity.SameSourcePath(x.SourceFilePath, item.Recording.SourceFilePath));
+    }
+
+    internal int RecoverPreviousSessionQueue(DateTimeOffset sessionStartedAt)
+    {
+        var resolved = 0;
+        var previousDispatched = new List<EncodeQueueItem>();
+        // Only an unstarted, undispatched waiting item may continue automatically.
+        // After dispatch (even before the first job acknowledgement), never start
+        // another encoder on restart; preserve the source and staging files.
+        foreach (var item in _store.Queue.ToArray())
+        {
+            if (item.State == EncodeQueueState.Waiting &&
+                string.IsNullOrWhiteSpace(item.ClientRequestId) &&
+                string.IsNullOrWhiteSpace(item.ExternalJobId) && item.StartedAt is null)
+                continue;
+
+            TvAirExternalJobDto? job = null;
+            if (!string.IsNullOrWhiteSpace(item.ExternalJobId))
+            {
+                try { job = _ctx.ExternalJobs.Get(item.ExternalJobId); }
+                catch { /* Unavailable job status is not proof of failure. */ }
+            }
+            if (job is not null && !string.IsNullOrWhiteSpace(item.ClientRequestId) &&
+                !string.IsNullOrWhiteSpace(job.ClientRequestId) &&
+                !string.Equals(item.ClientRequestId, job.ClientRequestId, StringComparison.Ordinal))
+                job = null;
+
+            var result = EncodeQueueState.Unverified;
+            var message = EncodeBridgeDefaults.UnverifiedResultMessage;
+            int? exit = job?.ExitCode;
+            if (job?.StateCode == TvAirExternalJobState.Failed)
+            {
+                result = EncodeQueueState.Failed;
+                message = job.Message ?? "前回の変換は失敗しました。";
+            }
+            else if (job?.StateCode == TvAirExternalJobState.Cancelled)
+            {
+                result = EncodeQueueState.Stopped;
+                message = "前回の変換は停止しました。";
+            }
+            else if (job?.StateCode == TvAirExternalJobState.Succeeded)
+            {
+                if (item.PostEncodeBatchRunning && File.Exists(item.ExpectedOutputPath))
+                {
+                    result = EncodeQueueState.Completed;
+                    message = string.Empty;
+                }
+                else if (item.HandoffOnly)
+                {
+                    result = EncodeQueueState.HandedOff;
+                    message = string.Empty;
+                }
+                else if (!item.PostEncodeBatchRunning && item.OutputFinalized &&
+                    (!item.Profile.PostEncodeBatchEnabled || string.IsNullOrWhiteSpace(item.Profile.PostEncodeBatch)) &&
+                    File.Exists(item.ExpectedOutputPath))
+                {
+                    result = EncodeQueueState.Completed;
+                    message = string.Empty;
+                }
+            }
+            _store.Queue.Remove(item);
+            _store.History.Add(ToHistory(item, result, exit, message,
+                job?.FinishedAt ?? sessionStartedAt));
+            previousDispatched.Add(item);
+            resolved++;
+        }
+        if (resolved > 0)
+        {
+            _storage.Save(_store);
+            // Remove orphaned temporary scripts only after the recovery history
+            // is committed. No media/staging file is deleted or overwritten.
+            foreach (var item in previousDispatched)
+                CleanupPostEncodeBatch(item);
+        }
+        return resolved;
+    }
+
+    private static EncodeHistoryItem ToHistory(EncodeQueueItem item, EncodeQueueState state,
+        int? exit, string message, DateTimeOffset finishedAt) => new()
+    {
+        QueueItemId = item.QueueItemId, RecordingId = item.Recording.RecordingId,
+        Title = item.Recording.Title, ServiceName = item.Recording.ServiceName,
+        ActualStart = item.Recording.ActualStart, SourceFilePath = item.Recording.SourceFilePath,
+        OutputFilePath = item.ExpectedOutputPath, ProfileName = item.Profile.ProfileName,
+        ToolName = item.Profile.ToolName, Result = state, StartedAt = item.StartedAt,
+        FinishedAt = finishedAt, ExitCode = exit, FailureMessage = message,
+        AttemptNumber = item.AttemptNumber, Recording = item.Recording, Profile = item.Profile
+    };
+
+    private void Fail(EncodeQueueItem item, string message, int? exitCode)
+        => Finish(item, EncodeQueueState.Failed, exitCode, message);
+
+    private void Finish(EncodeQueueItem item, EncodeQueueState state, int? exitCode, string message)
+    {
+        CleanupPostEncodeBatch(item);
+        item.State = state;
+        item.LastError = message;
+        _store.Queue.Remove(item);
+        _store.History.Add(ToHistory(item, state, exitCode, message, DateTimeOffset.Now));
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-        _powerGuard.Release(item.QueueItemId,$"terminal:{state}");
+        _powerGuard.Release(item.QueueItemId, $"terminal:{state}");
 #else
         _powerGuard.Release(item.QueueItemId);
 #endif
-        try{_adapters.Get(item.Profile.ToolKind).Cleanup(item);}catch{} }
-    private void PurgeHistory(){var cutoff=DateTimeOffset.Now.AddDays(-Math.Clamp(_store.Settings.HistoryRetentionDays,1,36500));_store.History.RemoveAll(x=>x.FinishedAt<cutoff);}
+        try { _adapters.Get(item.Profile.ToolKind).Cleanup(item); }
+        catch { /* Adapter cleanup must not replace the recorded terminal outcome. */ }
+    }
+    private int PurgeHistory()
+    {
+        var cutoff = DateTimeOffset.Now.AddDays(-Math.Clamp(_store.Settings.HistoryRetentionDays, EncodeBridgeDefaults.MinHistoryRetentionDays, EncodeBridgeDefaults.MaxHistoryRetentionDays));
+        return _store.History.RemoveAll(x => x.FinishedAt < cutoff);
+    }
 }

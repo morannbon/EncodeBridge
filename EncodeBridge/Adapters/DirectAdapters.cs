@@ -23,15 +23,16 @@ internal sealed class FfmpegAdapter : EncodeAdapterBase
     }
 }
 
-internal abstract class RigayaAdapterBase : EncodeAdapterBase
+internal abstract class SingleProgramAdapterBase : EncodeAdapterBase
 {
-    public override AdapterCheck Preflight(EncodeQueueItem item, TsServiceInfo s)
-    {
-        if (s.ProgramCount > 1)
-            return AdapterCheck.Fail("この録画ファイルでは対象番組を安全に選択できません。");
-        return AdapterCheck.Ok();
-    }
+    public sealed override AdapterCheck Preflight(EncodeQueueItem item, TsServiceInfo serviceInfo)
+        => serviceInfo.ProgramCount > 1
+            ? AdapterCheck.Fail("この録画ファイルでは対象番組を安全に選択できません。")
+            : AdapterCheck.Ok();
+}
 
+internal abstract class RigayaAdapterBase : SingleProgramAdapterBase
+{
     protected ExternalProcessPlan BuildRigaya(EncodeQueueItem item, TsServiceInfo s, string qualityOption)
     {
         var finalOutput = Output(item);
@@ -66,12 +67,9 @@ internal sealed class VceEncAdapter : RigayaAdapterBase
     public override ExternalProcessPlan BuildProcess(EncodeQueueItem item, TsServiceInfo serviceInfo) => BuildRigaya(item,serviceInfo,"--qvbr");
 }
 
-internal sealed class HandBrakeAdapter : EncodeAdapterBase
+internal sealed class HandBrakeAdapter : SingleProgramAdapterBase
 {
     public override EncodeToolKind Kind => EncodeToolKind.HandBrake;
-    public override AdapterCheck Preflight(EncodeQueueItem item, TsServiceInfo s)
-        => s.ProgramCount > 1 ? AdapterCheck.Fail("この録画ファイルでは対象番組を安全に選択できません。") : AdapterCheck.Ok();
-
     public override ExternalProcessPlan BuildProcess(EncodeQueueItem item, TsServiceInfo s)
     {
         var a = new List<string>
