@@ -144,6 +144,10 @@ button.button-danger:disabled,button.button-danger:disabled:hover{{color:{second
 .batch-field-control{{display:block;width:100%;min-width:0;}}
 .batch-script{{display:block;width:100%;max-width:none;margin-top:8px;font-family:Consolas,monospace;font-size:12px;background:{input};color:{fg};border:1px solid {border};padding:8px;box-sizing:border-box;resize:vertical;min-height:92px;line-height:1.45;}}
 .field-help{{display:block;margin-top:5px;font-size:12px;color:{muted};line-height:1.4;}}
+.profile-field-error{{display:block;margin:5px 0 0;font-size:12px;font-weight:700;color:{danger};line-height:1.5;overflow-wrap:anywhere;}}
+.output-mode-choices{{display:flex;flex-wrap:wrap;gap:6px 16px;margin:2px 0 9px;line-height:1.5;}}
+.output-mode-choices label{{display:inline-flex;align-items:center;gap:5px;cursor:pointer;min-height:25px;}}
+.output-mode-choices input[type=radio]{{width:16px;min-width:16px;height:16px;margin:0;accent-color:{selected};}}
 .batch-enable{{display:block;margin:8px 0 0 0;font-weight:600;line-height:20px;}}
 .batch-enable input[type=checkbox]{{width:auto;min-width:0;margin:0 6px 0 0;padding:0;vertical-align:middle;}}
 .batch-risk-note{{display:block;margin:0 0 8px 0;font-size:12px;color:{muted};line-height:1.45;}}
@@ -165,12 +169,16 @@ button.button-danger:disabled,button.button-danger:disabled:hover{{color:{second
 .profile-field.batch-section{{margin-top:4px;padding-top:12px;border-top:1px solid {border};}}
 .profile-empty{{margin-top:4px;}}
 .profile-extra{{font-size:12px;color:{muted};padding:2px 0 4px 29px;}}
+.profile-extra-warning{{color:{danger};font-weight:700;}}
 .history-row-actions{{display:flex;gap:14px;justify-content:flex-end;align-items:center;}}
 .history-clear-footer{{display:flex;justify-content:flex-end;margin-top:14px;}}
 .history-clear-confirm{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;justify-content:flex-end;}}
 .profile-list{{border:1px solid {border};background:{surface};}}
 .profile-line{{display:block;border-bottom:1px solid {border};padding:7px 10px;min-height:52px;}}
 .profile-line.is-default{{background:{controlHover};}}
+.profile-line.is-just-saved{{border-left:3px solid {selected};padding-left:7px;}}
+.profile-saved-indicator{{display:inline-block;font-size:12px;font-weight:700;color:{selected};white-space:nowrap;}}
+.profile-save-notice{{margin:10px 0 0;padding:10px 12px;background:{surface};border:1px solid {border};border-left:3px solid {selected};color:{fg};line-height:1.5;}}
 .profile-line:last-child{{border-bottom:0;}}
 .profile-default-form{{display:flex;align-items:center;}}
 .profile-default-label{{display:inline-flex;align-items:center;justify-content:center;cursor:pointer;min-height:22px;min-width:24px;}}

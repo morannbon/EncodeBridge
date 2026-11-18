@@ -431,14 +431,18 @@ internal sealed class EncodeBridgeRuntime : IDisposable
             string.Equals(x.PluginId, "encodebridge", StringComparison.OrdinalIgnoreCase) &&
             string.Equals(x.FeatureId, "encode-profile", StringComparison.OrdinalIgnoreCase)).ToArray();
         var isKeywordReservation = string.Equals(file.ReservationSource, "Keyword", StringComparison.OrdinalIgnoreCase);
-        // Automatic-search recordings require exactly one explicit selected binding;
-        // every other reservation source uses the enabled default profile. Manual
-        // recording stops, insufficient files and automatic-OFF are separate gates.
+        // Automatic-search rules are opt-in. No EncodeBridge binding is the normal
+        // default OFF state: reservation_not_opted_in means deliberate non-conversion,
+        // not an error or a reason to ask the user to check their settings.
+        // A present but duplicated/blank binding is a separate invalid configuration.
+        // Both are terminal non-admissions; all non-Keyword reservations use the
+        // enabled default profile without requiring a rule-level binding.
         if (isKeywordReservation && (bindings.Length != 1 || string.IsNullOrWhiteSpace(bindings[0].SelectionId)))
         {
             MarkFinalizedFileProcessed(file.RecordingFileId);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-            WriteDeveloperDiagnostic($"ENCODEBRIDGE_FILE_DECISION result=SKIPPED reason=reservation_not_opted_in service={DiagnosticQuote(file.ServiceName)} title={DiagnosticQuote(file.ProgramTitle)} reservationSource={DiagnosticQuote(file.ReservationSource)} bindingCount={bindings.Length}");
+            var skipReason = bindings.Length == 0 ? "reservation_not_opted_in" : "invalid_reservation_binding";
+            WriteDeveloperDiagnostic($"ENCODEBRIDGE_FILE_DECISION result=SKIPPED reason={skipReason} service={DiagnosticQuote(file.ServiceName)} title={DiagnosticQuote(file.ProgramTitle)} reservationSource={DiagnosticQuote(file.ReservationSource)} bindingCount={bindings.Length}");
 #endif
             return true;
         }
@@ -587,6 +591,11 @@ internal sealed class EncodeBridgeRuntime : IDisposable
             _storage.Save(Store);
             _scheduler.Evaluate();
         }
+    }
+
+    public bool VerifyProfilePersisted(EncodeProfile profile)
+    {
+        lock (_gate) return StorageHealthy && _storage.VerifyProfilePersisted(profile);
     }
 
     private void EvaluateIfStorageHealthy()

@@ -1,5 +1,6 @@
 param([Parameter(Mandatory=$true)][ValidateSet('x64','x86')][string]$Platform,[Parameter(Mandatory=$true)][string]$RefName)
 $ErrorActionPreference='Stop'
+Set-Location -LiteralPath (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent)
 $spec=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'package-spec.json') -Raw|ConvertFrom-Json
 if($RefName.StartsWith('v') -and $RefName -cne "v$($spec.Version)"){throw 'Tag/version mismatch'}
 if((Get-FileHash README.md).Hash -ne (Get-FileHash README.txt).Hash){throw 'README mismatch'}
@@ -26,13 +27,11 @@ if($spec.Name -eq 'TvAIr'){
 foreach($doc in @('README.md','README.txt','LICENSE')){Copy-Item -LiteralPath $doc -Destination $out}
 foreach($doc in @('THIRD_PARTY_NOTICES.txt','SDK_LICENSE.txt')){if(Test-Path -LiteralPath $doc){Copy-Item -LiteralPath $doc -Destination $out}}
 if($spec.Name -eq 'AI-rhythm'){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'SDK_LICENSE.txt') -Destination $out}
-$instructions=if($spec.Name -eq 'TvAIr'){'ZIPを展開したフォルダー一式を配置してTvAIr.exeを起動してください。READMEの動作環境と初回設定に従ってください。'}else{"TvAIr v1.2.14と同じアーキテクチャを使用してください。TvAIrを終了し、$($spec.Dll)をTvAIr.exeと同じ場所のPluginsフォルダーへ配置してください。"}
 @"
-$($spec.Name) v$($spec.Version) ($Platform) - ビルド済み配布
+$($spec.Name) v$($spec.Version) ($Platform)
 
-Visual Studioによるビルドは不要です。必要なランタイムと利用条件はREADMEをご確認ください。
-$instructions
-更新時はTvAIrを終了し、新しいファイルを今までのPluginsフォルダへ上書きしてください。設定ファイルはそのまま残ります。
-外部アプリやプラグインが必要な機能はREADMEの条件に従って設定してください。
-"@|Set-Content -LiteralPath (Join-Path $out 'INSTALL.txt') -Encoding utf8
+Visual Studioによるビルドは不要です。
+TvAIr v1.2.14以上が必要です。推奨はv1.3.0です。TvAIrと同じアーキテクチャを選んでください。TvAIrを終了してEncodeBridge.dllをTvAIrのPluginsフォルダへ配置してください。更新時は既存DLLを上書きしてください。
+詳しい導入方法と利用条件はREADMEを確認してください。
+"@ | Set-Content -LiteralPath (Join-Path $out 'INSTALL.txt') -Encoding utf8
 Compress-Archive -Path "$out/*" -DestinationPath "package/$($spec.Name)_v$($spec.Version)_$Platform.zip"

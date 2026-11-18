@@ -30,15 +30,7 @@ internal sealed class EncodeBridgeStorage
         _revision = result.Value.Revision;
         try
         {
-            var raw = result.Value.Value;
-            EncodeBridgeStore? store = raw switch
-            {
-                JsonElement e => e.Deserialize<EncodeBridgeStore>(JsonOptions),
-                string s => JsonSerializer.Deserialize<EncodeBridgeStore>(s, JsonOptions),
-                _ => JsonSerializer.Deserialize<EncodeBridgeStore>(JsonSerializer.Serialize(raw, JsonOptions), JsonOptions)
-            };
-            if (store is null) throw new InvalidDataException("保存データを読み込めませんでした。");
-            return Migrate(store);
+            return Migrate(DeserializeStore(result.Value.Value));
         }
         catch (Exception ex)
         {
@@ -54,6 +46,47 @@ internal sealed class EncodeBridgeStorage
         if (!result.Succeeded || result.Value is null)
             throw new InvalidOperationException(result.Error?.Message ?? "EncodeBridgeの設定を保存できませんでした。");
         _revision = result.Value.Revision;
+    }
+
+    // A successful Set is not enough to acknowledge a profile edit: read the
+    // authoritative Host storage back and verify all editable fields.
+    // Do not advance _revision or modify the in-memory Store on this read.
+    public bool VerifyProfilePersisted(EncodeProfile expected)
+    {
+        try
+        {
+            var result = _storage.Get(Namespace, StoreKey);
+            if (!result.Succeeded || result.Value is null) return false;
+            var store = DeserializeStore(result.Value.Value);
+            var actual = store.Profiles.FirstOrDefault(profile =>
+                string.Equals(profile.ProfileId, expected.ProfileId, StringComparison.OrdinalIgnoreCase));
+            return actual is not null
+                && string.Equals(actual.Name, expected.Name, StringComparison.Ordinal)
+                && actual.Enabled == expected.Enabled
+                && string.Equals(actual.ToolId, expected.ToolId, StringComparison.Ordinal)
+                && actual.VideoCodec == expected.VideoCodec
+                && actual.Quality == expected.Quality
+                && string.Equals(actual.Container, expected.Container, StringComparison.Ordinal)
+                && actual.OutputDirectoryMode == expected.OutputDirectoryMode
+                && string.Equals(actual.OutputDirectory, expected.OutputDirectory, StringComparison.Ordinal)
+                && string.Equals(actual.SourceSubdirectoryName, expected.SourceSubdirectoryName, StringComparison.Ordinal)
+                && actual.OutputDirectoryChoiceConfirmed == expected.OutputDirectoryChoiceConfirmed
+                && actual.PostEncodeBatchEnabled == expected.PostEncodeBatchEnabled
+                && string.Equals(actual.PostEncodeBatch, expected.PostEncodeBatch, StringComparison.Ordinal)
+                && actual.PostEncodeBatchRiskAccepted == expected.PostEncodeBatchRiskAccepted;
+        }
+        catch (Exception) { return false; }
+    }
+
+    private static EncodeBridgeStore DeserializeStore(object? raw)
+    {
+        var store = raw switch
+        {
+            JsonElement e => e.Deserialize<EncodeBridgeStore>(JsonOptions),
+            string value => JsonSerializer.Deserialize<EncodeBridgeStore>(value, JsonOptions),
+            _ => JsonSerializer.Deserialize<EncodeBridgeStore>(JsonSerializer.Serialize(raw, JsonOptions), JsonOptions)
+        };
+        return store ?? throw new InvalidDataException("保存データを読み込めませんでした。");
     }
 
     private static EncodeBridgeStore Migrate(EncodeBridgeStore store)

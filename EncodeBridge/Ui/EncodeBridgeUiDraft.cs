@@ -3,6 +3,10 @@ using System.Collections.Generic;
 
 namespace EncodeBridge;
 
+internal enum ProfileCommitClaim { Accepted, Completed, InProgress, Invalid }
+
+internal readonly record struct ProfileSaveFeedback(string ProfileId, bool Created, bool Published, bool Verified);
+
 internal static class EncodeBridgeUiDraft
 {
     private static readonly object Gate = new();
@@ -12,6 +16,10 @@ internal static class EncodeBridgeUiDraft
         public Dictionary<string, string> Profile { get; } = new(StringComparer.OrdinalIgnoreCase);
         public bool PostBatchConsentPending { get; set; }
         public string ValidationError { get; set; } = string.Empty;
+        public string ActiveCommitToken { get; set; } = string.Empty;
+        public string ProcessingCommitToken { get; set; } = string.Empty;
+        public string CompletedCommitToken { get; set; } = string.Empty;
+        public ProfileSaveFeedback? SaveFeedback { get; set; }
     }
 
     private static readonly Dictionary<string, WindowDraft> ByWindow = new(StringComparer.Ordinal);
@@ -42,6 +50,105 @@ internal static class EncodeBridgeUiDraft
         {
             var draft = GetWindow(windowId, false);
             draft.ValidationError = string.Empty;
+            Cleanup(windowId, draft);
+        }
+    }
+
+    // A form-instance token stays stable across picker/navigation round trips.
+    // Only an explicit new/edit action issues a new token. Replayed POSTs cannot
+    // create a second profile even if the Host redirects after a successful save.
+    public static string GetProfileCommitToken(string windowId)
+    {
+        lock (Gate) return GetWindow(windowId, false).ActiveCommitToken;
+    }
+
+    public static ProfileCommitClaim CheckProfileCommit(string windowId, string token)
+    {
+        lock (Gate)
+        {
+            var draft = GetWindow(windowId, false);
+            if (string.IsNullOrWhiteSpace(token)) return ProfileCommitClaim.Invalid;
+            if (string.Equals(draft.CompletedCommitToken, token, StringComparison.Ordinal))
+                return ProfileCommitClaim.Completed;
+            if (string.Equals(draft.ProcessingCommitToken, token, StringComparison.Ordinal))
+                return ProfileCommitClaim.InProgress;
+            return string.Equals(draft.ActiveCommitToken, token, StringComparison.Ordinal)
+                ? ProfileCommitClaim.Accepted : ProfileCommitClaim.Invalid;
+        }
+    }
+
+    public static ProfileCommitClaim ClaimProfileCommit(string windowId, string token)
+    {
+        lock (Gate)
+        {
+            var draft = GetWindow(windowId, false);
+            if (string.IsNullOrWhiteSpace(token)) return ProfileCommitClaim.Invalid;
+            if (string.Equals(draft.CompletedCommitToken, token, StringComparison.Ordinal))
+                return ProfileCommitClaim.Completed;
+            if (string.Equals(draft.ProcessingCommitToken, token, StringComparison.Ordinal))
+                return ProfileCommitClaim.InProgress;
+            if (!string.Equals(draft.ActiveCommitToken, token, StringComparison.Ordinal))
+                return ProfileCommitClaim.Invalid;
+            draft.ProcessingCommitToken = token;
+            return ProfileCommitClaim.Accepted;
+        }
+    }
+
+    public static void AbortProfileCommit(string windowId, string token)
+    {
+        lock (Gate)
+        {
+            var draft = GetWindow(windowId, false);
+            if (string.Equals(draft.ProcessingCommitToken, token, StringComparison.Ordinal))
+                draft.ProcessingCommitToken = string.Empty;
+        }
+    }
+
+    public static void CompleteProfileCommit(string windowId, string token, string profileId, bool created, bool verified)
+    {
+        lock (Gate)
+        {
+            var draft = GetWindow(windowId, true);
+            if (!string.Equals(draft.ProcessingCommitToken, token, StringComparison.Ordinal))
+                throw new InvalidOperationException("プロファイルの保存操作を確認できませんでした。");
+            draft.ProcessingCommitToken = string.Empty;
+            draft.CompletedCommitToken = token;
+            draft.SaveFeedback = new ProfileSaveFeedback(profileId, created, Published: true, Verified: verified);
+            // A later new/edit action might already have issued a new form token.
+            // Do not discard that newer user's draft.
+            if (string.Equals(draft.ActiveCommitToken, token, StringComparison.Ordinal))
+            {
+                draft.ActiveCommitToken = string.Empty;
+                draft.Profile.Clear();
+                draft.Tool.Clear();
+                draft.PostBatchConsentPending = false;
+                draft.ValidationError = string.Empty;
+            }
+        }
+    }
+
+    public static void MarkProfilePublishFailure(string windowId, string profileId)
+    {
+        lock (Gate)
+        {
+            var draft = GetWindow(windowId, false);
+            if (draft.SaveFeedback is { } feedback &&
+                string.Equals(feedback.ProfileId, profileId, StringComparison.OrdinalIgnoreCase))
+                draft.SaveFeedback = feedback with { Published = false };
+        }
+    }
+
+    public static ProfileSaveFeedback? GetProfileSaveFeedback(string windowId)
+    {
+        lock (Gate) return GetWindow(windowId, false).SaveFeedback;
+    }
+
+    public static void ClearProfileSaveFeedback(string windowId)
+    {
+        lock (Gate)
+        {
+            var draft = GetWindow(windowId, false);
+            draft.SaveFeedback = null;
             Cleanup(windowId, draft);
         }
     }
@@ -106,7 +213,12 @@ internal static class EncodeBridgeUiDraft
 
     public static void SetProfileOutput(string windowId, string path)
     {
-        lock (Gate) GetWindow(windowId, true).Profile["outputDir"] = path?.Trim() ?? string.Empty;
+        lock (Gate)
+        {
+            var profile = GetWindow(windowId, true).Profile;
+            profile["outputDir"] = path?.Trim() ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(path)) profile["outputMode"] = "Fixed";
+        }
     }
 
     public static void SetProfileTool(string windowId, string toolId)
@@ -121,6 +233,9 @@ internal static class EncodeBridgeUiDraft
             var profile = GetWindow(windowId, true).Profile;
             profile.Clear();
             foreach (var pair in values) profile[pair.Key] = pair.Value ?? string.Empty;
+            var draft = GetWindow(windowId, true);
+            draft.ActiveCommitToken = Guid.NewGuid().ToString("N");
+            draft.SaveFeedback = null;
         }
     }
 
@@ -140,6 +255,7 @@ internal static class EncodeBridgeUiDraft
         {
             var draft = GetWindow(windowId, false);
             draft.Profile.Clear();
+            draft.ActiveCommitToken = string.Empty;
             draft.PostBatchConsentPending = false;
             draft.ValidationError = string.Empty;
             Cleanup(windowId, draft);
@@ -148,7 +264,9 @@ internal static class EncodeBridgeUiDraft
 
     private static void Cleanup(string windowId, WindowDraft draft)
     {
-        if (draft.Tool.Count == 0 && draft.Profile.Count == 0 && !draft.PostBatchConsentPending && string.IsNullOrEmpty(draft.ValidationError))
+        if (draft.Tool.Count == 0 && draft.Profile.Count == 0 && !draft.PostBatchConsentPending && string.IsNullOrEmpty(draft.ValidationError)
+            && string.IsNullOrEmpty(draft.ActiveCommitToken) && string.IsNullOrEmpty(draft.ProcessingCommitToken)
+            && string.IsNullOrEmpty(draft.CompletedCommitToken) && draft.SaveFeedback is null)
             ByWindow.Remove(windowId ?? string.Empty);
     }
 
@@ -182,7 +300,8 @@ internal static class EncodeBridgeUiDraft
             || k.Equals("refreshTarget", StringComparison.OrdinalIgnoreCase)
             || k.Equals("preserve-scroll", StringComparison.OrdinalIgnoreCase)
             || k.Equals("preserveScroll", StringComparison.OrdinalIgnoreCase)
-            || k.Equals("feedbackRequested", StringComparison.OrdinalIgnoreCase);
+            || k.Equals("feedbackRequested", StringComparison.OrdinalIgnoreCase)
+            || k.Equals("commitToken", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string NormalizeFieldName(string key)

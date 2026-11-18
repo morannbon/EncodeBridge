@@ -29,8 +29,7 @@ internal static class EncodeProfilePolicy
     {
         var profile = ResolveDefault(store);
         var tool = ResolveTool(store, profile?.ToolId);
-        return tool is not null && !string.IsNullOrWhiteSpace(tool.ExecutablePath)
-            && System.IO.File.Exists(tool.ExecutablePath);
+        return tool is not null && EncodeToolIdentity.ConfigurationError(tool.Kind, tool.ExecutablePath) is null;
     }
 
     public static void EnsureInitialDefault(EncodeBridgeStore store, EncodeProfile profile)
@@ -44,8 +43,12 @@ internal static class EncodeProfilePolicy
 
     public static void SelectDefault(EncodeBridgeStore store, string profileId)
     {
-        if (ResolveEnabledById(store, profileId) is null)
-            throw new InvalidOperationException("有効な変換プロファイルを選択してください。");
+        var profile = ResolveEnabledById(store, profileId)
+            ?? throw new InvalidOperationException("有効な変換プロファイルを選択してください。");
+        var tool = ResolveTool(store, profile.ToolId)
+            ?? throw new InvalidOperationException("変換ツールが登録されていません。実行ファイルを指定してください。");
+        var toolError = EncodeToolIdentity.ConfigurationError(tool.Kind, tool.ExecutablePath);
+        if (toolError is not null) throw new InvalidOperationException(toolError);
 
         // Reuse a disabled default rule before adding a new one. Exactly one
         // enabled default rule owns both the UI selection and automatic admission.

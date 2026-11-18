@@ -102,6 +102,7 @@ internal sealed class EncodeProfile
     public string Container { get; set; } = EncodeBridgeDefaults.DefaultContainer;
     public OutputDirectoryMode OutputDirectoryMode { get; set; } = OutputDirectoryMode.SameAsSource;
     public string OutputDirectory { get; set; } = string.Empty;
+    public bool OutputDirectoryChoiceConfirmed { get; set; }
     public string SourceSubdirectoryName { get; set; } = EncodeBridgeDefaults.DefaultSourceSubdirectory;
     public Dictionary<string, string> AdapterSettings { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public List<string> AdditionalArguments { get; set; } = new();

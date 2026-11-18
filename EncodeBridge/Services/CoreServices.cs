@@ -281,6 +281,15 @@ internal sealed class EncodeScheduler
     {
         var dispatchAttempted = false;
         item.WaitingReason = string.Empty;
+        // A legacy or frozen snapshot can still contain a mismatched executable.
+        // Fail it without launching anything; an explicit retry can then adopt
+        // the corrected saved profile, while the original TS remains untouched.
+        var identityError = EncodeToolIdentity.IdentityError(item.Profile.ToolKind, item.Profile.ExecutablePath);
+        if (identityError is not null)
+        {
+            Fail(item, identityError, null);
+            return true;
+        }
         if (!File.Exists(item.Recording.SourceFilePath))
         {
             Fail(item, "録画ファイルが見つかりません。", null);

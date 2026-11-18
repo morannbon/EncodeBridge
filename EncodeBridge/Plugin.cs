@@ -20,7 +20,7 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
     {
         PluginId = PluginId,
         DisplayName = "EncodeBridge",
-        Version = "1.0.2",
+        Version = "1.0.3",
         SdkContractVersion = "1.1.16",
         RequiredPermissions = BuildRequiredPermissions(),
         Windows = new[]
@@ -28,7 +28,7 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
             new PluginWindowDefinition
             {
                 WindowDefinitionId = WindowId,
-                Title = "EncodeBridge v1.0.2",
+                Title = "EncodeBridge v1.0.3",
                 Multiplicity = PluginWindowMultiplicity.Single,
                 InitialSize = new PluginWindowSize(820,720),
                 MinimumSize = new PluginWindowSize(620,520),
@@ -166,8 +166,16 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
         var profilePostBatchEnabled = profileDraft.ContainsKey("postEncodeBatchEnabled")
             ? GetBool(profileDraft, "postEncodeBatchEnabled", false)
             : (activeProfile?.PostEncodeBatchEnabled ?? false);
-        var profileOutputValue = FirstNonBlank(outputDir,
-            activeProfile?.OutputDirectoryMode == OutputDirectoryMode.Fixed ? activeProfile.OutputDirectory : string.Empty);
+        var profileOutputValue = profileDraft.ContainsKey("outputDir") ? outputDir
+            : activeProfile?.OutputDirectoryMode == OutputDirectoryMode.Fixed ? activeProfile.OutputDirectory : string.Empty;
+        var profileOutputModeValue = profileDraft.ContainsKey("outputMode") ? Draft(profileDraft, "outputMode")
+            : activeProfile is null ? "Fixed" : ProfileLocationChoice(activeProfile);
+        var profileOutputError = editingProfile ? OutputLocationError(profileOutputModeValue, profileOutputValue) : string.Empty;
+        var profileToolError = editingProfile ? ToolConfigurationError(toolKindValue, toolPathValue) : string.Empty;
+        var profileOutputWarning = FieldErrorMarkup(profileOutputError);
+        var profileToolWarning = FieldErrorMarkup(profileToolError);
+        var profileBatchError = editingProfile ? PostEncodeBatchError(profilePostBatchEnabled, profilePostBatchValue) : string.Empty;
+        var profileBatchWarning = FieldErrorMarkup(profileBatchError);
         var profileCommitAction = activeProfile is null ? "add-profile" : "save-profile";
         var postBatchConsentPending = EncodeBridgeUiDraft.IsPostBatchConsentPending(context.CurrentWindowId)
             && profilePostBatchEnabled;
@@ -178,6 +186,7 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
             ? "<button class=\"button-primary\" type=\"submit\" name=\"action\" value=\"confirm-post-batch-save\">自己責任を了承します</button><button class=\"button-secondary\" type=\"submit\" name=\"action\" value=\"cancel-post-batch-save\">キャンセル</button>"
             : $"<button class=\"button-primary\" type=\"submit\" name=\"action\" value=\"{profileCommitAction}\">保存</button>";
         var profileIdHidden = activeProfile is null ? string.Empty : Hidden("profileId", activeProfile.ProfileId);
+        var profileCommitToken = EncodeBridgeUiDraft.GetProfileCommitToken(context.CurrentWindowId);
         
         var availableToolOptions = string.Join("", s.Tools.Where(t => File.Exists(t.ExecutablePath)).Select(t => $"<option value=\"{H(t.ToolId)}\"{Selected(Draft(profileDraft, "toolId"), t.ToolId)}>{H(ProfileDisplay.ToolName(t.Kind))}</option>"));
         var existingToolChooser = s.Tools.Count == 0 ? string.Empty : $"<div class=\"profile-field\"><label class=\"field-label\" for=\"existing-tool\">登録済みの実行ファイルを使用</label><div class=\"field-control field-control-with-action\"><select id=\"existing-tool\" name=\"existingToolId\"><option value=\"\">選択してください</option>{availableToolOptions}</select><button class=\"button-secondary\" type=\"submit\" name=\"action\" value=\"use-registered-tool\">選択</button></div></div>";
@@ -186,6 +195,12 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
             ? $"<div class=\"notice danger\">{H(rt.StorageError)}</div>"
             : string.IsNullOrWhiteSpace(rt.FileJournalError) ? string.Empty : $"<div class=\"notice danger\">{H(rt.FileJournalError)}</div>";
         var profileError = editingProfile && !string.IsNullOrWhiteSpace(draftError)
+            && !string.Equals(draftError, profileOutputError, StringComparison.Ordinal)
+            && !string.Equals(draftError, profileToolError, StringComparison.Ordinal)
+            && !string.Equals(draftError, profileBatchError, StringComparison.Ordinal)
+            ? $"<div class=\"notice danger\" role=\"alert\">{H(draftError)}</div>"
+            : string.Empty;
+        var profileSectionError = !editingProfile && !string.IsNullOrWhiteSpace(draftError)
             ? $"<div class=\"notice danger\" role=\"alert\">{H(draftError)}</div>"
             : string.Empty;
         var css = EncodeBridgeStyles.BuildCss(context);
@@ -194,25 +209,32 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
 <div class="profile-editor-shell">
 {profileError}
 <div class="profile-editor-title">{(creatingNewProfile ? "新しいプロファイル" : $"プロファイルを編集　{H(ProfileDisplay.Name(activeTool?.Kind ?? EncodeBridgeDefaults.DefaultToolKind, activeProfile?.Quality ?? EncodeBridgeDefaults.DefaultQuality, activeProfile?.VideoCodec ?? EncodeBridgeDefaults.DefaultVideoCodec, activeProfile?.Container ?? EncodeBridgeDefaults.DefaultContainer))}")}</div>
-<form method="post" action="{H(context.ActionEndpoint)}">{formHead}{profileIdHidden}{Hidden("toolId", FirstNonBlank(Draft(profileDraft, "toolId"), DraftToolId))}
+<form method="post" action="{H(context.ActionEndpoint)}">{formHead}{profileIdHidden}{Hidden("commitToken", profileCommitToken)}{Hidden("toolId", FirstNonBlank(Draft(profileDraft, "toolId"), DraftToolId))}
 <div class="profile-card unified-config-card">
 <div class="profile-fields"><div class="editor-group-title">変換ツール・実行ファイル</div>
 {existingToolChooser}
 <div class="profile-field"><label class="field-label" for="profile-kind">変換ツール</label><div class="field-control"><select id="profile-kind" name="kind"><option value="Ffmpeg"{Selected(toolKindValue, "Ffmpeg")}>FFmpeg</option><option value="NvEncC"{Selected(toolKindValue, "NvEncC")}>NVEncC</option><option value="QsvEncC"{Selected(toolKindValue, "QsvEncC")}>QSVEncC</option><option value="VceEncC"{Selected(toolKindValue, "VceEncC")}>VCEEncC</option><option value="HandBrake"{Selected(toolKindValue, "HandBrake")}>HandBrakeCLI</option><option value="Amatsukaze"{Selected(toolKindValue, "Amatsukaze")}>Amatsukaze</option><option value="TmpgEnc"{Selected(toolKindValue, "TmpgEnc")}>TMPGEnc</option><option value="Custom"{Selected(toolKindValue, "Custom")}>その他CLI</option></select></div></div>
-<div class="profile-field"><label class="field-label" for="profile-path">実行ファイル</label><div class="field-control field-control-with-action"><input id="profile-path" class="path-readonly" name="path" value="{H(toolPathValue)}" readonly><button class="button-secondary" type="submit" name="action" value="pick-tool-path">参照</button></div></div>
+<div class="profile-field"><label class="field-label" for="profile-path">実行ファイル</label><div class="field-control field-control-with-action"><input id="profile-path" class="path-readonly" name="path" value="{H(toolPathValue)}" readonly><button class="button-secondary" type="submit" name="action" value="pick-tool-path">参照</button></div>{profileToolWarning}</div>
 <div class="editor-group-title">変換設定</div><div class="profile-pair-grid">
 <div class="profile-field"><label class="field-label" for="profile-quality">品質</label><div class="field-control"><select id="profile-quality" name="quality"><option value="High"{Selected(profileQualityValue, "High")}>高画質</option><option value="Standard"{Selected(profileQualityValue, "Standard")}>標準</option><option value="Compact"{Selected(profileQualityValue, "Compact")}>少容量</option></select></div></div>
 <div class="profile-field"><label class="field-label" for="profile-video">映像</label><div class="field-control"><select id="profile-video" name="video"><option value="H265"{Selected(profileVideoValue, "H265")}>H.265</option><option value="H264"{Selected(profileVideoValue, "H264")}>H.264</option><option value="Av1"{Selected(profileVideoValue, "Av1")}>AV1</option></select></div></div>
 <div class="profile-field"><label class="field-label" for="profile-container">出力形式</label><div class="field-control"><select id="profile-container" name="container"><option value="mkv"{Selected(profileContainerValue, "mkv")}>MKV</option><option value="mp4"{Selected(profileContainerValue, "mp4")}>MP4</option></select></div></div>
 </div>
-<div class="editor-group-title">保存先・変換後の処理</div><div class="profile-field"><label class="field-label" for="profile-output-dir">保存先</label><div class="field-control field-control-with-action"><input id="profile-output-dir" class="path-readonly" name="outputDir" value="{H(profileOutputValue)}" readonly><button class="button-secondary" type="submit" name="action" value="pick-output-dir">参照</button></div></div>
-<div class="profile-field batch-section"><label class="field-label" for="profile-post-batch">変換成功後の処理</label><div class="field-control batch-field-control"><div class="batch-risk-note">任意のWindowsコマンドを実行できます。削除・移動・上書き等の記述内容と実行結果はサポート対象外です。</div><label class="batch-enable"><input type="checkbox" name="postEncodeBatchEnabled" value="true" {(profilePostBatchEnabled ? "checked" : "")}> 変換成功後にバッチを実行する</label>{postBatchConsentPanel}<textarea id="profile-post-batch" class="batch-script" name="postEncodeBatch" rows="5" maxlength="{EncodeBridgeDefaults.MaxPostEncodeBatchLength}">{H(profilePostBatchValue)}</textarea><div class="field-help">&#123;source&#125;=元TS、&#123;output&#125;=変換後ファイル。ほかに &#123;sourceDir&#125; &#123;outputDir&#125; &#123;sourceName&#125; &#123;outputName&#125; も使用できます。</div></div></div>
+<div class="editor-group-title">保存先・変換後の処理</div><div class="profile-field"><span class="field-label">保存先</span><div class="output-mode-choices" role="group" aria-label="保存先の方法"><label><input type="radio" name="outputMode" value="Fixed" {(profileOutputModeValue == "Fixed" ? "checked" : "")}> 指定したフォルダー</label><label><input type="radio" name="outputMode" value="SameAsSource" {(profileOutputModeValue == "SameAsSource" ? "checked" : "")}> 元TSと同じ場所</label><label><input type="radio" name="outputMode" value="SourceSubdirectory" {(profileOutputModeValue == "SourceSubdirectory" ? "checked" : "")}> 元TSのサブフォルダー</label></div><div class="field-control field-control-with-action"><input id="profile-output-dir" class="path-readonly" name="outputDir" value="{H(profileOutputValue)}" readonly aria-label="指定した保存先フォルダー"><button class="button-secondary" type="submit" name="action" value="pick-output-dir">参照</button></div><div class="field-help">「指定したフォルダー」は参照で保存先を選択してください。ほかの保存方法ではフォルダー指定は不要です。</div>{profileOutputWarning}</div>
+<div class="profile-field batch-section"><label class="field-label" for="profile-post-batch">変換成功後の処理</label><div class="field-control batch-field-control"><div class="batch-risk-note">任意のWindowsコマンドを実行できます。削除・移動・上書き等の記述内容と実行結果はサポート対象外です。</div><label class="batch-enable"><input type="checkbox" name="postEncodeBatchEnabled" value="true" {(profilePostBatchEnabled ? "checked" : "")}> 変換成功後にバッチを実行する</label>{postBatchConsentPanel}<textarea id="profile-post-batch" class="batch-script" name="postEncodeBatch" rows="5" maxlength="{EncodeBridgeDefaults.MaxPostEncodeBatchLength}">{H(profilePostBatchValue)}</textarea><div class="field-help">&#123;source&#125;=元TS、&#123;output&#125;=変換後ファイル。ほかに &#123;sourceDir&#125; &#123;outputDir&#125; &#123;sourceName&#125; &#123;outputName&#125; も使用できます。</div>{profileBatchWarning}</div></div>
 </div>
 <div class="profile-actions"><button class="button-secondary" type="submit" name="action" value="cancel-edit-profile">キャンセル</button>{profileCommitButtons}</div>
 </div></form></div>
 """ : string.Empty;
+        var savedFeedback = EncodeBridgeUiDraft.GetProfileSaveFeedback(context.CurrentWindowId);
         var savedProfiles = RenderRegisteredProfiles(context, s, defaultRule?.ProfileId ?? string.Empty,
-            creatingNewProfile ? string.Empty : draftProfileId, editorMarkup);
+            creatingNewProfile ? string.Empty : draftProfileId, editorMarkup, savedFeedback);
+        var profileSaveNotice = savedFeedback is { } feedback
+            && s.Profiles.FirstOrDefault(x => string.Equals(x.ProfileId, feedback.ProfileId, StringComparison.OrdinalIgnoreCase)) is { } savedProfile
+                ? feedback.Verified
+                    ? $"<div class=\"profile-save-notice\" role=\"status\">{H(ProfileDisplay.Label(s, savedProfile))} を{(feedback.Created ? "登録" : "更新")}しました。{(feedback.Published ? "" : "TvAIrへの選択肢の反映には失敗しました。")}</div>"
+                    : "<div class=\"profile-field-error\" role=\"alert\">保存データの再読込結果を確認できません。保存ボタンを繰り返さず設定を確認してください。</div>"
+                : string.Empty;
         var clearPending = PendingHistoryClear.ContainsKey(context.CurrentWindowId);
         var historyClearAction = clearPending
             ? $"<form class=\"history-clear-confirm\" method=\"post\" action=\"{H(context.ActionEndpoint)}\">{formHead}<span>履歴をすべて削除しますか？</span><button class=\"button-danger\" type=\"submit\" name=\"action\" value=\"delete-history\">すべて削除する</button><button class=\"button-secondary\" type=\"submit\" name=\"action\" value=\"cancel-delete-history\">キャンセル</button></form>"
@@ -229,7 +251,7 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
 <div id="encodebridge-root" class="eb-root">
 <style>{css}</style>
 <table class="head-table" role="presentation"><tr>
-<td><h1>EncodeBridge <span class="app-version">v1.0.2</span></h1><div class="sub">録画終了後の変換を外部ツールへ引き渡します。</div></td>
+<td><h1>EncodeBridge <span class="app-version">v1.0.3</span></h1><div class="sub">録画終了後の変換を外部ツールへ引き渡します。</div></td>
 <td class="head-action"><form method="post" action="{H(context.ActionEndpoint)}" class="auto-toggle-form">{formHead}<input type="hidden" name="enabled" value="{(!s.Settings.AutoEncodeEnabled).ToString().ToLowerInvariant()}"><span class="auto-toggle-label">自動変換</span><button class="auto-switch {(s.Settings.AutoEncodeEnabled ? "is-on" : "is-off")}" type="submit" name="action" value="toggle-auto" role="switch" aria-checked="{s.Settings.AutoEncodeEnabled.ToString().ToLowerInvariant()}" aria-label="自動変換を{(s.Settings.AutoEncodeEnabled ? "OFF" : "ON")}に切り替える" title="{(s.Settings.AutoEncodeEnabled ? "自動変換 ON" : "自動変換 OFF")}"{autoDisabled}><span class="auto-toggle-track" aria-hidden="true"><span class="auto-toggle-thumb"></span></span></button><span class="auto-toggle-state {(s.Settings.AutoEncodeEnabled ? "is-on" : "is-off")}">{autoLabel}</span></form></td>
 </tr></table>
 <div class="auto-hint">{H(autoHint)}</div>
@@ -253,7 +275,9 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
 </div></form></div>
 
 <div class="section"><div class="section-heading-row"><div><h2>変換プロファイル</h2><div class="section-help">○ を選んだプロファイルは、TvAIrから指定がない通常の自動変換で使用します。</div></div>{(editingProfile ? string.Empty : $"<form method=\"post\" action=\"{H(context.ActionEndpoint)}\">{formHead}<button class=\"button-primary\" type=\"submit\" name=\"action\" value=\"new-profile\">＋ プロファイルを追加</button></form>")}</div>
+{profileSectionError}
 {savedProfiles}
+{profileSaveNotice}
 {(creatingNewProfile ? editorMarkup : string.Empty)}
 </div>
 
@@ -275,6 +299,8 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
             var action = context.ActionName;
             if (string.IsNullOrWhiteSpace(action) && p.TryGetValue("action", out var payloadAction)) action = payloadAction;
             action = action?.Trim() ?? string.Empty;
+            if (action is not ("add-profile" or "save-profile" or "confirm-post-batch-save"))
+                EncodeBridgeUiDraft.ClearProfileSaveFeedback(context.CurrentWindowId);
 
             switch (action)
             {
@@ -314,6 +340,7 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
                         return RuntimeUiActionResult.Fail(result.ErrorCode ?? "picker_failed", result.Message ?? "実行ファイルを選択できませんでした。");
                     EncodeBridgeUiDraft.SetToolPath(context.CurrentWindowId, result.SelectedPath);
                     EncodeBridgeUiDraft.SetProfileTool(context.CurrentWindowId, DraftToolId);
+                    EncodeBridgeUiDraft.ClearValidationError(context.CurrentWindowId);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
                     rt.WriteDeveloperDiagnostic($"ENCODEBRIDGE_TOOL_PICK result=OK window={context.CurrentWindowId} previousPresent={!string.IsNullOrWhiteSpace(current)} selectedPresent=True profileSelection=draft_tool");
 #endif
@@ -329,6 +356,7 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
                     if (!result.Accepted || string.IsNullOrWhiteSpace(result.SelectedPath))
                         return RuntimeUiActionResult.Fail(result.ErrorCode ?? "picker_failed", result.Message ?? "保存先を選択できませんでした。");
                     EncodeBridgeUiDraft.SetProfileOutput(context.CurrentWindowId, result.SelectedPath);
+                    EncodeBridgeUiDraft.ClearValidationError(context.CurrentWindowId);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
                     rt.WriteDeveloperDiagnostic($"ENCODEBRIDGE_OUTPUT_PICK result=OK window={context.CurrentWindowId} selectedPresent=True");
 #endif
@@ -393,6 +421,7 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
                         ["quality"] = EncodeBridgeDefaults.DefaultQuality.ToString(),
                         ["container"] = EncodeBridgeDefaults.DefaultContainer,
                         ["outputDir"] = string.Empty,
+                        ["outputMode"] = "Fixed",
                         ["postEncodeBatch"] = string.Empty,
                         ["postEncodeBatchEnabled"] = "false"
                     });
@@ -419,6 +448,8 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
                 case "add-profile":
                 case "save-profile":
                 {
+                    if (!CanProcessProfileSubmission(context.CurrentWindowId, Get(p, "commitToken")))
+                        return RefreshResult();
                     EncodeBridgeUiDraft.CaptureProfile(context.CurrentWindowId, p);
                     EncodeBridgeUiDraft.CaptureTool(context.CurrentWindowId, p);
                     var profileValues = EncodeBridgeUiDraft.SnapshotProfile(context.CurrentWindowId);
@@ -427,6 +458,18 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
                     var existingProfile = string.IsNullOrWhiteSpace(existingProfileId)
                         ? null
                         : rt.Store.Profiles.FirstOrDefault(x => string.Equals(x.ProfileId, existingProfileId, StringComparison.OrdinalIgnoreCase));
+                    // Do not ask the user to consent to a batch when the profile
+                    // itself cannot be saved. Both fields use the same validation
+                    // functions as the final commit.
+                    var toolDraft = EncodeBridgeUiDraft.SnapshotTool(context.CurrentWindowId);
+                    var effectiveTool = EncodeProfilePolicy.ResolveTool(rt.Store, Get(profileValues, "toolId"));
+                    if (!string.IsNullOrEmpty(ToolConfigurationError(FirstNonBlank(Get(toolDraft, "kind"), effectiveTool?.Kind.ToString() ?? EncodeBridgeDefaults.DefaultToolKind.ToString()), FirstNonBlank(Get(toolDraft, "path"), effectiveTool?.ExecutablePath ?? string.Empty)))
+                        || !string.IsNullOrEmpty(OutputLocationError(Get(profileValues, "outputMode"), Get(profileValues, "outputDir")))
+                        || !string.IsNullOrEmpty(PostEncodeBatchError(requestedPostBatchEnabled, Get(profileValues, "postEncodeBatch"))))
+                    {
+                        EncodeBridgeUiDraft.SetPostBatchConsentPending(context.CurrentWindowId, false);
+                        return RefreshResult();
+                    }
                     var requiresPostBatchConsent = requestedPostBatchEnabled && (existingProfile is null || !existingProfile.PostEncodeBatchEnabled || !existingProfile.PostEncodeBatchRiskAccepted);
                     if (requiresPostBatchConsent)
                     {
@@ -437,10 +480,12 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
                         return RefreshResult();
                     }
 
-                    return CommitProfileOrShowError(rt, context.CurrentWindowId, profileValues, acceptPostBatchRisk: false);
+                    return CommitProfileOrShowError(rt, context.CurrentWindowId, Get(p, "commitToken"), profileValues, acceptPostBatchRisk: false);
                 }
                 case "confirm-post-batch-save":
                 {
+                    if (!CanProcessProfileSubmission(context.CurrentWindowId, Get(p, "commitToken")))
+                        return RefreshResult();
                     EncodeBridgeUiDraft.CaptureProfile(context.CurrentWindowId, p);
                     EncodeBridgeUiDraft.CaptureTool(context.CurrentWindowId, p);
                     var profileValues = EncodeBridgeUiDraft.SnapshotProfile(context.CurrentWindowId);
@@ -449,13 +494,13 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
                         EncodeBridgeUiDraft.SetPostBatchConsentPending(context.CurrentWindowId, false);
                         return RefreshResult();
                     }
-                    var saveResult = CommitProfileOrShowError(rt, context.CurrentWindowId, profileValues, acceptPostBatchRisk: true);
+                    var saveResult = CommitProfileOrShowError(rt, context.CurrentWindowId, Get(p, "commitToken"), profileValues, acceptPostBatchRisk: true);
                     if (!string.IsNullOrWhiteSpace(EncodeBridgeUiDraft.GetValidationError(context.CurrentWindowId)))
                         return saveResult;
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
                     rt.WriteDeveloperDiagnostic($"ENCODEBRIDGE_POST_BATCH_CONSENT result=ACCEPTED source=profile_save window={context.CurrentWindowId}");
 #endif
-                    return RefreshResult("設定を保存しました。");
+                    return saveResult;
                 }
                 case "cancel-post-batch-save":
                     EncodeBridgeUiDraft.SetPostBatchConsentPending(context.CurrentWindowId, false);
@@ -545,44 +590,79 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
         }
     }
 
-    private static RuntimeUiActionResult CommitProfileOrShowError(EncodeBridgeRuntime rt, string windowId,
-        Dictionary<string, string> profileValues, bool acceptPostBatchRisk)
+    private static bool CanProcessProfileSubmission(string windowId, string commitToken)
     {
+        var state = EncodeBridgeUiDraft.CheckProfileCommit(windowId, commitToken);
+        if (state == ProfileCommitClaim.Invalid)
+            EncodeBridgeUiDraft.SetValidationError(windowId, "保存画面が更新されています。編集内容を確認してください。");
+        return state == ProfileCommitClaim.Accepted;
+    }
+
+    private static RuntimeUiActionResult CommitProfileOrShowError(EncodeBridgeRuntime rt, string windowId,
+        string commitToken, Dictionary<string, string> profileValues, bool acceptPostBatchRisk)
+    {
+        var claim = EncodeBridgeUiDraft.ClaimProfileCommit(windowId, commitToken);
+        if (claim == ProfileCommitClaim.Completed) return RefreshResult();
+        if (claim == ProfileCommitClaim.InProgress) return RefreshResult();
+        if (claim == ProfileCommitClaim.Invalid)
+        {
+            EncodeBridgeUiDraft.SetValidationError(windowId, "保存画面が更新されています。編集内容を確認してください。");
+            return RefreshResult();
+        }
+
         try
         {
-            SaveProfileDraft(rt, windowId, profileValues, EncodeBridgeUiDraft.SnapshotTool(windowId), acceptPostBatchRisk);
-            EncodeBridgeUiDraft.ClearValidationError(windowId);
-            return RefreshResult("設定を保存しました。");
+            var saved = SaveProfileDraft(rt, profileValues, EncodeBridgeUiDraft.SnapshotTool(windowId), acceptPostBatchRisk);
+            var verified = rt.VerifyProfilePersisted(saved.Profile);
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+            rt.WriteDeveloperDiagnostic($"ENCODEBRIDGE_PROFILE_SAVE_VERIFY result={(verified ? "OK" : "UNVERIFIED")} profileId={saved.Profile.ProfileId} outputMode={saved.Profile.OutputDirectoryMode} outputConfigured={!string.IsNullOrWhiteSpace(saved.Profile.OutputDirectory)}");
+#endif
+            // Storage has already accepted the write. Consume the form token even
+            // when readback fails, so a repeated click cannot duplicate a profile.
+            // Storage is durable before the UI acknowledges completion. Remember the
+            // form token before publishing to Host, so a failed publication cannot
+            // cause the next click to create a duplicate profile.
+            EncodeBridgeUiDraft.CompleteProfileCommit(windowId, commitToken, saved.Profile.ProfileId, saved.Created, verified);
+            try
+            {
+                rt.PublishProfileSelections();
+            }
+            catch (Exception)
+            {
+                EncodeBridgeUiDraft.MarkProfilePublishFailure(windowId, saved.Profile.ProfileId);
+                return RefreshResult();
+            }
+#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
+            rt.WriteDeveloperDiagnostic($"ENCODEBRIDGE_PROFILE_COMMIT result={(verified ? "SAVED" : "UNVERIFIED")} profileId={saved.Profile.ProfileId} profiles={rt.Store.Profiles.Count} tools={rt.Store.Tools.Count} published=True");
+#endif
+            return RefreshResult();
         }
         catch (InvalidOperationException ex)
         {
-            // The saved state is unchanged; retain the draft and render an actionable error.
+            // Persisted state was not changed by validation failures. Preserve input
+            // so the user can correct the error without starting over.
             EncodeBridgeUiDraft.SetValidationError(windowId, ex.Message);
             EncodeBridgeUiDraft.SetPostBatchConsentPending(windowId, false);
             return RefreshResult();
         }
+        finally
+        {
+            EncodeBridgeUiDraft.AbortProfileCommit(windowId, commitToken);
+        }
     }
 
-    private static void SaveProfileDraft(EncodeBridgeRuntime rt, string windowId, Dictionary<string, string> profileValues, Dictionary<string, string> toolValues, bool acceptPostBatchRisk)
+    private static (EncodeProfile Profile, bool Created) SaveProfileDraft(EncodeBridgeRuntime rt,
+        Dictionary<string, string> profileValues, Dictionary<string, string> toolValues, bool acceptPostBatchRisk)
     {
         var originalToolId = Get(profileValues, "toolId");
         var toolCreated = ResolveDraftToolForProfile(rt, profileValues, toolValues);
         try
         {
             profileValues["postEncodeBatchRiskAccepted"] = acceptPostBatchRisk ? "true" : "false";
-            if (string.IsNullOrWhiteSpace(Get(profileValues, "profileId")))
-                AddProfile(rt, profileValues);
-            else
-                SaveProfile(rt, profileValues);
-
+            var created = string.IsNullOrWhiteSpace(Get(profileValues, "profileId"));
+            var savedProfile = created ? AddProfile(rt, profileValues) : SaveProfile(rt, profileValues);
             rt.Save();
-            rt.PublishProfileSelections();
-#if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-            rt.WriteDeveloperDiagnostic($"ENCODEBRIDGE_PROFILE_COMMIT result=SAVED profiles={rt.Store.Profiles.Count} tools={rt.Store.Tools.Count} published=True");
-#endif
-            EncodeBridgeUiDraft.ClearProfile(windowId);
-            if (toolCreated) EncodeBridgeUiDraft.ClearTool(windowId);
-            EncodeBridgeUiDraft.SetPostBatchConsentPending(windowId, false);
+            return (savedProfile, created);
         }
         catch
         {
@@ -641,14 +721,19 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
         return kind;
     }
 
-    private static string ValidateExecutablePath(string path)
+    private static (EncodeToolKind Kind, string Path) ValidateToolSelection(string kindText, string path)
     {
-        path = path.Trim();
-        if (string.IsNullOrWhiteSpace(path))
-            throw new InvalidOperationException("実行ファイルを指定してください。");
-        if (!File.Exists(path))
-            throw new InvalidOperationException("指定した実行ファイルが見つかりません。");
-        return path;
+        var kind = ParseToolKind(kindText);
+        var normalized = path?.Trim() ?? string.Empty;
+        var error = EncodeToolIdentity.ConfigurationError(kind, normalized);
+        if (error is not null) throw new InvalidOperationException(error);
+        return (kind, normalized);
+    }
+
+    private static string ToolConfigurationError(string kindText, string path)
+    {
+        try { ValidateToolSelection(kindText, path); return string.Empty; }
+        catch (InvalidOperationException ex) { return ex.Message; }
     }
 
     private static EncodeTool CreateTool(EncodeToolKind kind, string path) => new()
@@ -660,8 +745,8 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
 
     private static EncodeTool AddTool(EncodeBridgeRuntime rt, IReadOnlyDictionary<string, string> values)
     {
-        var kind = ParseToolKind(FirstNonBlank(Get(values, "kind"), EncodeBridgeDefaults.DefaultToolKind.ToString()));
-        var path = ValidateExecutablePath(Get(values, "path"));
+        var (kind, path) = ValidateToolSelection(
+            FirstNonBlank(Get(values, "kind"), EncodeBridgeDefaults.DefaultToolKind.ToString()), Get(values, "path"));
         var tool = CreateTool(kind, path);
         rt.Store.Tools.Add(tool);
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
@@ -700,8 +785,9 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
     {
         var existingId = Get(profileValues, "toolId");
         var selectedTool = EncodeProfilePolicy.ResolveTool(rt.Store, existingId);
-        var kind = ParseToolKind(FirstNonBlank(Get(toolDraft, "kind"), selectedTool?.Kind.ToString() ?? EncodeBridgeDefaults.DefaultToolKind.ToString()));
-        var path = ValidateExecutablePath(FirstNonBlank(Get(toolDraft, "path"), selectedTool?.ExecutablePath ?? string.Empty));
+        var (kind, path) = ValidateToolSelection(
+            FirstNonBlank(Get(toolDraft, "kind"), selectedTool?.Kind.ToString() ?? EncodeBridgeDefaults.DefaultToolKind.ToString()),
+            FirstNonBlank(Get(toolDraft, "path"), selectedTool?.ExecutablePath ?? string.Empty));
 
         var existing = rt.Store.Tools.FirstOrDefault(x => x.Kind == kind && string.Equals(x.ExecutablePath, path, StringComparison.OrdinalIgnoreCase));
         if (existing is not null)
@@ -733,7 +819,42 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
 
     private readonly record struct ValidatedProfileEdit(
         EncodeTool Tool, VideoCodecMode Video, QualityPreset Quality, string Container,
-        string OutputDirectory, string PostEncodeBatch, bool PostEncodeBatchEnabled, bool PostEncodeBatchRiskAccepted);
+        OutputDirectoryMode OutputMode, string OutputDirectory, string PostEncodeBatch,
+        bool PostEncodeBatchEnabled, bool PostEncodeBatchRiskAccepted);
+
+    private static string ProfileLocationChoice(EncodeProfile profile)
+    {
+        if (profile.OutputDirectoryMode == OutputDirectoryMode.Fixed)
+            return string.IsNullOrWhiteSpace(profile.OutputDirectory) ? string.Empty : "Fixed";
+        return profile.OutputDirectoryChoiceConfirmed ? profile.OutputDirectoryMode.ToString() : string.Empty;
+    }
+
+    private static (OutputDirectoryMode Mode, string Path) ValidateOutputLocation(string mode, string rawPath)
+    {
+        if (!Enum.TryParse<OutputDirectoryMode>(mode, false, out var parsed) || !Enum.IsDefined(parsed))
+            throw new InvalidOperationException("保存先の方法が選択されていません。保存先を指定するか元TSと同じ場所を選択してください。");
+        if (parsed != OutputDirectoryMode.Fixed) return (parsed, string.Empty);
+        var path = (rawPath ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(path))
+            throw new InvalidOperationException("保存先フォルダーが設定されていません。参照から保存先を選択してください。");
+        if (!Directory.Exists(path))
+            throw new InvalidOperationException("指定した保存先フォルダーが見つかりません。保存先を再指定してください。");
+        return (parsed, path);
+    }
+
+    private static string OutputLocationError(string mode, string path)
+    {
+        try { ValidateOutputLocation(mode, path); return string.Empty; }
+        catch (InvalidOperationException ex) { return ex.Message; }
+    }
+
+    private static string PostEncodeBatchError(bool enabled, string script)
+        => enabled && string.IsNullOrWhiteSpace(script)
+            ? "変換後バッチのコマンドが設定されていません。入力するか実行をOFFにしてください。"
+            : string.Empty;
+
+    private static string FieldErrorMarkup(string message) => string.IsNullOrWhiteSpace(message)
+        ? string.Empty : $"<div class=\"profile-field-error\" role=\"alert\">{H(message)}</div>";
 
     // Validate the complete edit before changing the stored profile. New and existing
     // profiles use identical parsing, path checks and output/batch normalization.
@@ -742,6 +863,8 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
     {
         var tool = EncodeProfilePolicy.ResolveTool(rt.Store, Get(values, "toolId"))
             ?? throw new InvalidOperationException("変換ツールを選択してください。");
+        var toolError = EncodeToolIdentity.ConfigurationError(tool.Kind, tool.ExecutablePath);
+        if (toolError is not null) throw new InvalidOperationException(toolError);
         var videoText = FirstNonBlank(Get(values, "video"), fallbackVideo.ToString());
         if (!Enum.TryParse<VideoCodecMode>(videoText, true, out var video) || !Enum.IsDefined(video))
             throw new InvalidOperationException("映像設定を確認してください。");
@@ -749,14 +872,14 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
         if (!Enum.TryParse<QualityPreset>(qualityText, true, out var quality) || !Enum.IsDefined(quality))
             throw new InvalidOperationException("品質設定を確認してください。");
 
-        var output = Get(values, "outputDir").Trim();
-        if (!string.IsNullOrWhiteSpace(output) && !Directory.Exists(output))
-            throw new InvalidOperationException("指定した保存先が見つかりません。");
+        var location = ValidateOutputLocation(Get(values, "outputMode"), Get(values, "outputDir"));
+        var batch = ValidatePostEncodeBatch(Get(values, "postEncodeBatch"));
+        var batchEnabled = GetBool(values, "postEncodeBatchEnabled", false);
+        var batchError = PostEncodeBatchError(batchEnabled, batch);
+        if (!string.IsNullOrEmpty(batchError)) throw new InvalidOperationException(batchError);
         return new ValidatedProfileEdit(
-            tool, video, quality, NormalizeContainer(Get(values, "container")), output,
-            ValidatePostEncodeBatch(Get(values, "postEncodeBatch")),
-            GetBool(values, "postEncodeBatchEnabled", false),
-            GetBool(values, "postEncodeBatchRiskAccepted", false));
+            tool, video, quality, NormalizeContainer(Get(values, "container")), location.Mode, location.Path,
+            batch, batchEnabled, GetBool(values, "postEncodeBatchRiskAccepted", false));
     }
 
     private static void ApplyProfileEdit(EncodeProfile profile, ValidatedProfileEdit edit, bool retainAcceptedRisk)
@@ -767,22 +890,23 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
         profile.VideoCodec = edit.Video;
         profile.Quality = edit.Quality;
         profile.Container = edit.Container;
-        profile.OutputDirectoryMode = string.IsNullOrWhiteSpace(edit.OutputDirectory)
-            ? OutputDirectoryMode.SameAsSource : OutputDirectoryMode.Fixed;
+        profile.OutputDirectoryMode = edit.OutputMode;
         profile.OutputDirectory = edit.OutputDirectory;
+        profile.OutputDirectoryChoiceConfirmed = true;
         profile.PostEncodeBatch = edit.PostEncodeBatch;
         profile.PostEncodeBatchEnabled = edit.PostEncodeBatchEnabled;
         profile.PostEncodeBatchRiskAccepted = edit.PostEncodeBatchEnabled &&
             (edit.PostEncodeBatchRiskAccepted || previouslyAccepted);
     }
 
-    private static void AddProfile(EncodeBridgeRuntime rt, IReadOnlyDictionary<string, string> values)
+    private static EncodeProfile AddProfile(EncodeBridgeRuntime rt, IReadOnlyDictionary<string, string> values)
     {
         var edit = ValidateProfileEdit(rt, values, EncodeBridgeDefaults.DefaultVideoCodec, EncodeBridgeDefaults.DefaultQuality);
         var profile = new EncodeProfile();
         ApplyProfileEdit(profile, edit, retainAcceptedRisk: false);
         rt.Store.Profiles.Add(profile);
         EncodeProfilePolicy.EnsureInitialDefault(rt.Store, profile);
+        return profile;
     }
 
 
@@ -800,6 +924,7 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
             ["quality"] = profile.Quality.ToString(),
             ["container"] = profile.Container,
             ["outputDir"] = profile.OutputDirectoryMode == OutputDirectoryMode.Fixed ? profile.OutputDirectory : string.Empty,
+            ["outputMode"] = ProfileLocationChoice(profile),
             ["postEncodeBatch"] = profile.PostEncodeBatch,
             ["postEncodeBatchEnabled"] = profile.PostEncodeBatchEnabled.ToString().ToLowerInvariant(),
             ["postEncodeBatchRiskAccepted"] = profile.PostEncodeBatchRiskAccepted.ToString().ToLowerInvariant()
@@ -809,7 +934,7 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
 #endif
     }
 
-    private static void SaveProfile(EncodeBridgeRuntime rt, IReadOnlyDictionary<string, string> values)
+    private static EncodeProfile SaveProfile(EncodeBridgeRuntime rt, IReadOnlyDictionary<string, string> values)
     {
         var profile = rt.Store.Profiles.FirstOrDefault(x =>
             string.Equals(x.ProfileId, Get(values, "profileId"), StringComparison.OrdinalIgnoreCase))
@@ -823,8 +948,9 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
             PruneUnusedTools(rt);
         }
 #if ENCODEBRIDGE_DEVELOPER_DIAGNOSTICS
-        rt.WriteDeveloperDiagnostic($"ENCODEBRIDGE_PROFILE_SAVE result=OK profileId={profile.ProfileId} toolChanged={!string.Equals(previousToolId, profile.ToolId, StringComparison.OrdinalIgnoreCase)} toolId={profile.ToolId} postBatchEnabled={profile.PostEncodeBatchEnabled} postBatchTextBlank={string.IsNullOrWhiteSpace(profile.PostEncodeBatch)} postBatchRiskAccepted={profile.PostEncodeBatchRiskAccepted} postBatchEffective={profile.PostEncodeBatchEnabled && !string.IsNullOrWhiteSpace(profile.PostEncodeBatch) && profile.PostEncodeBatchRiskAccepted}");
+        rt.WriteDeveloperDiagnostic($"ENCODEBRIDGE_PROFILE_SAVE result=OK profileId={profile.ProfileId} toolChanged={!string.Equals(previousToolId, profile.ToolId, StringComparison.OrdinalIgnoreCase)} toolId={profile.ToolId} outputMode={profile.OutputDirectoryMode} outputConfigured={!string.IsNullOrWhiteSpace(profile.OutputDirectory)} postBatchEnabled={profile.PostEncodeBatchEnabled} postBatchTextBlank={string.IsNullOrWhiteSpace(profile.PostEncodeBatch)} postBatchRiskAccepted={profile.PostEncodeBatchRiskAccepted} postBatchEffective={profile.PostEncodeBatchEnabled && !string.IsNullOrWhiteSpace(profile.PostEncodeBatch) && profile.PostEncodeBatchRiskAccepted}");
 #endif
+        return profile;
     }
 
 
@@ -863,7 +989,7 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
         rt.Store.Tools.RemoveAll(x => !used.Contains(x.ToolId));
     }
 
-    private static string RenderRegisteredProfiles(RuntimeUiRenderContext c, EncodeBridgeStore s, string defaultProfileId, string editingProfileId, string editorMarkup)
+    private static string RenderRegisteredProfiles(RuntimeUiRenderContext c, EncodeBridgeStore s, string defaultProfileId, string editingProfileId, string editorMarkup, ProfileSaveFeedback? savedFeedback)
     {
         if (s.Profiles.Count == 0)
             return "<div class=\"empty profile-empty\">プロファイルはまだありません。［＋ プロファイルを追加］から登録してください。</div>";
@@ -873,12 +999,31 @@ public sealed class EncodeBridgePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRu
             var displayName = ProfileDisplay.Label(s, p);
             var isDefault = string.Equals(p.ProfileId, defaultProfileId, StringComparison.OrdinalIgnoreCase);
             var batchState = p.PostEncodeBatchEnabled ? "バッチ ON" : "バッチ OFF";
-            var outputState = p.OutputDirectoryMode == OutputDirectoryMode.Fixed ? "保存先 設定済み" : "保存先 元TSと同じ";
+            var locationConfirmed = !string.IsNullOrWhiteSpace(ProfileLocationChoice(p));
+            var outputState = !locationConfirmed ? "保存先 未確認（編集して選択してください）"
+                : p.OutputDirectoryMode switch
+                {
+                    OutputDirectoryMode.Fixed => "保存先 設定済み",
+                    OutputDirectoryMode.SameAsSource => "保存先 元TSと同じ場所",
+                    OutputDirectoryMode.SourceSubdirectory => "保存先 元TSのサブフォルダー",
+                    _ => "保存先 未確認"
+                };
             var choose = $"<form method=\"post\" action=\"{H(c.ActionEndpoint)}\" class=\"profile-default-form\">{FormHidden(c)}{Hidden("profileId", p.ProfileId)}<label class=\"profile-default-label\" title=\"既定プロファイルに設定\"><input id=\"profile-default-radio-{H(p.ProfileId)}\" type=\"radio\" name=\"profile-choice-{H(defaultProfileId)}\" value=\"{H(p.ProfileId)}\" {(isDefault ? "checked" : string.Empty)} onchange=\"this.form.querySelector('button[type=submit]').click()\" aria-label=\"{H(displayName)}を既定のプロファイルに設定\"></label><button class=\"profile-default-submit\" type=\"submit\" name=\"action\" value=\"set-default-profile\" tabindex=\"-1\" aria-hidden=\"true\">適用</button></form>";
             var edit = $"<form method=\"post\" action=\"{H(c.ActionEndpoint)}\">{FormHidden(c)}{Hidden("profileId", p.ProfileId)}<button class=\"button-secondary small-action\" type=\"submit\" name=\"action\" value=\"edit-profile\">編集</button></form>";
             var remove = $"<form method=\"post\" action=\"{H(c.ActionEndpoint)}\">{FormHidden(c)}{Hidden("profileId", p.ProfileId)}<button class=\"button-danger small-action\" type=\"submit\" name=\"action\" value=\"remove-profile\">削除</button></form>";
             var expanded = string.Equals(p.ProfileId, editingProfileId, StringComparison.OrdinalIgnoreCase);
-            return $"<div id=\"profile-line-{H(p.ProfileId)}\" class=\"profile-line {(isDefault ? "is-default" : string.Empty)}\"><div class=\"profile-title-row\">{choose}<b>{H(displayName)}</b><span id=\"profile-default-label-{H(p.ProfileId)}\" class=\"default-choice-label\"{(isDefault ? string.Empty : " hidden")}>既定</span><div class=\"profile-line-actions\">{edit}{remove}</div></div>{(expanded ? editorMarkup : string.Empty)}<div class=\"profile-extra\">{H(outputState)}　/　{H(batchState)}</div></div>";
+            var justSaved = savedFeedback is { } feedback && string.Equals(feedback.ProfileId, p.ProfileId, StringComparison.OrdinalIgnoreCase);
+            var savedLabel = justSaved && savedFeedback is { } receipt
+                ? receipt.Verified ? "<span class=\"profile-saved-indicator\">保存しました</span>"
+                    : "<span class=\"profile-field-error\">保存確認できません</span>"
+                : string.Empty;
+            var outputDisplay = locationConfirmed ? H(outputState)
+                : $"<span class=\"profile-extra-warning\">{H(outputState)}</span>";
+            var tool = EncodeProfilePolicy.ResolveTool(s, p.ToolId);
+            var toolError = tool is null ? "変換ツールが登録されていません。編集して実行ファイルを指定してください。"
+                : EncodeToolIdentity.ConfigurationError(tool.Kind, tool.ExecutablePath);
+            var toolWarning = FieldErrorMarkup(toolError ?? string.Empty);
+            return $"<div id=\"profile-line-{H(p.ProfileId)}\" class=\"profile-line {(isDefault ? "is-default" : string.Empty)} {(justSaved ? "is-just-saved" : string.Empty)}\"><div class=\"profile-title-row\">{choose}<b>{H(displayName)}</b>{savedLabel}<span id=\"profile-default-label-{H(p.ProfileId)}\" class=\"default-choice-label\"{(isDefault ? string.Empty : " hidden")}>既定</span><div class=\"profile-line-actions\">{edit}{remove}</div></div>{(expanded ? editorMarkup : string.Empty)}{(expanded ? string.Empty : toolWarning)}<div class=\"profile-extra\">{outputDisplay}　/　{H(batchState)}</div></div>";
         }));
         return $"<div class=\"profile-list\">{rows}</div>";
     }

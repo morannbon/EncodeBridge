@@ -15,7 +15,12 @@ internal abstract class EncodeAdapterBase : IEncodeAdapter
 {
     public abstract EncodeToolKind Kind { get; }
     public virtual AdapterCheck ValidateTool(EncodeProfileSnapshot profile)
-        => File.Exists(profile.ExecutablePath) ? AdapterCheck.Ok() : AdapterCheck.Fail("変換ツールを使用できません。");
+    {
+        if (profile.ToolKind != Kind)
+            return AdapterCheck.Fail("変換ツールと変換設定の種類が一致しません。");
+        var error = EncodeToolIdentity.ConfigurationError(profile.ToolKind, profile.ExecutablePath);
+        return error is null ? AdapterCheck.Ok() : AdapterCheck.Fail(error);
+    }
     public virtual AdapterCheck Preflight(EncodeQueueItem item, TsServiceInfo serviceInfo) => AdapterCheck.Ok();
     public abstract ExternalProcessPlan BuildProcess(EncodeQueueItem item, TsServiceInfo serviceInfo);
     public virtual void Cleanup(EncodeQueueItem item)
